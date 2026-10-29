@@ -12,6 +12,20 @@
 - Vector DB: Qdrant Cloud (qdrant-client) with fastembed embeddings. PostgreSQL 16 for app data. Redis for cache/TTL.
 - Background jobs: FastAPI BackgroundTasks first; Celery later only if asked.
 
+## Resolved architecture decisions
+- Build order: Foundation > Auth + OTP > Chat modes > LangGraph > Providers + RAG > Integration.
+- Planning starts only via POST /api/v1/conversations/{id}/messages and
+  POST /api/v1/chat/temporary. Do not create a separate /trips/plan endpoint.
+- Canonical trip response fields: route_legs, hotels, attractions, itinerary_days,
+  transport_options, booking_links, data_sources.
+- Health routes are /api/v1/health and /api/v1/ready. Readiness checks PostgreSQL
+  and Redis only.
+- The LangGraph checkpointer implementation and dependency decision is deferred.
+- JWT access tokens will carry sid and jti; remaining token/session details are
+  finalized in the Auth module.
+- Temporary chat may use tab/session-bound Redis TTL state only. It must not create
+  PostgreSQL rows, LangGraph checkpoints, or LangSmith traces.
+
 ## Hard rules
 - Never read, print, log or commit real secrets. Never open backend/.env.
   Only .env.example with placeholders goes in the repo.
@@ -27,11 +41,3 @@
 - After coding, run tests and report real results. Do not claim tests passed unless you ran them.
 - Explain every file in simple Hinglish.
 - Stop after the task. Do not start the next module.
-
-
-Build order: Foundation → Auth + OTP → Chat modes (saved/temporary) → LangGraph → Providers + RAG → Integration. Codex ko ye khud assume nahi karna.
-Trip start endpoint: sirf POST /conversations/{id}/messages (saved) aur POST /chat/temporary. Alag POST /trips/plan nahi banega.
-Response field names (canonical): route_legs, hotels, attractions, itinerary_days, transport_options, booking_links, data_sources. Ye Backend.pdf ke typed contract se hain. Baaki naam (routes, hotel_options, booking_options) use nahi honge.
-Auth: JWT cookie + auth_sessions approved. JWT mein sid aur jti rahenge, details Auth module ke prompt mein final karenge.
-LangGraph checkpoints: abhi defer, jab LangGraph module aayega tab decide.
-Temporary chat Redis state: Codex ki interpretation sahi hai (sirf TTL, koi PostgreSQL row, checkpoint ya trace nahi).
