@@ -1,7 +1,18 @@
-# DevSafar Backend - Foundation
+# DevSafar Backend - Foundation + Auth/OTP
 
 Python 3.12 FastAPI foundation with async PostgreSQL, Redis, versioned health routes,
 safe error responses, structured redacted logs, Docker, and tests.
+
+Auth uses Argon2id passwords and revocable, short-lived HS256 JWT sessions. The JWT is
+sent only in an HttpOnly SameSite=Lax cookie; authenticated writes also require the
+double-submit CSRF cookie/header pair. Password-reset OTPs and reset grants are stored
+only as keyed hashes. For local development, SMTP-less OTP delivery is skipped only when
+`ENVIRONMENT=development` and `DEV_OTP_EMAIL_FALLBACK_ENABLED=true`; the code is never logged.
+
+Set a persistent, random `SECRET_KEY` in the local environment for stable development
+sessions. If it is absent only in `development`, the app generates a process-local key and
+logs a warning; all sessions then become invalid after restart. Staging and production
+still refuse to start without an explicitly configured key.
 
 ## Local setup
 
@@ -34,8 +45,13 @@ part of readiness.
 
 ## Quality checks
 
+Auth/OTP integration tests require a real PostgreSQL database named `devsafar_test`.
+Export `TEST_DATABASE_URL` in the test process; the test suite deliberately does not load
+`backend/.env`. `TEST_REDIS_URL` is optional and defaults to local Redis database 15.
+
 ```powershell
 ruff check .
+mypy app
 pytest
 ```
 

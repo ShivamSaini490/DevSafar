@@ -1,6 +1,7 @@
 import json
 import logging
 import re
+import traceback
 from collections.abc import Iterable, Mapping, Sequence
 from datetime import UTC, datetime
 from typing import Any
@@ -72,6 +73,18 @@ def redact_exception_message(
     return message
 
 
+def redact_exception_traceback(
+    exc: BaseException,
+    *,
+    secret_values: Iterable[str] = (),
+) -> str:
+    rendered = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+    for secret in secret_values:
+        if secret:
+            rendered = rendered.replace(secret, "[REDACTED]")
+    return redact_sensitive_text(rendered)
+
+
 class RedactingJsonFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
         payload: dict[str, Any] = {
@@ -93,10 +106,13 @@ class RedactingJsonFormatter(logging.Formatter):
 
 
 def configure_logging(level: str) -> None:
-    handler = logging.StreamHandler()
-    handler.setFormatter(RedactingJsonFormatter())
-
     root_logger = logging.getLogger()
-    root_logger.handlers.clear()
-    root_logger.addHandler(handler)
+    formatter = RedactingJsonFormatter()
+    if root_logger.handlers:
+        for existing_handler in root_logger.handlers:
+            existing_handler.setFormatter(formatter)
+    else:
+        handler = logging.StreamHandler()
+        handler.setFormatter(formatter)
+        root_logger.addHandler(handler)
     root_logger.setLevel(level)

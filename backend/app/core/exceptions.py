@@ -7,7 +7,12 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from app.core.logging import redact_sensitive_data, redact_sensitive_text
+from app.core.config import Settings
+from app.core.logging import (
+    redact_exception_traceback,
+    redact_sensitive_data,
+    redact_sensitive_text,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -15,17 +20,18 @@ logger = logging.getLogger(__name__)
 class AppError(Exception):
     def __init__(
         self,
-        *,
         status_code: int,
         code: str,
         message: str,
         details: dict[str, Any] | None = None,
+        headers: dict[str, str] | None = None,
     ) -> None:
         super().__init__(message)
         self.status_code = status_code
         self.code = code
         self.message = message
         self.details = details
+        self.headers = headers
 
 
 class ServiceUnavailableError(AppError):
@@ -49,6 +55,7 @@ def _error_response(
     code: str,
     message: str,
     details: dict[str, Any] | list[dict[str, Any]] | None = None,
+    headers: dict[str, str] | None = None,
 ) -> JSONResponse:
     error: dict[str, Any] = {
         "code": code,
@@ -57,7 +64,26 @@ def _error_response(
     }
     if details is not None:
         error["details"] = redact_sensitive_data(details)
-    return JSONResponse(status_code=status_code, content={"error": error})
+    return JSONResponse(status_code=status_code, content={"error": error}, headers=headers)
+
+
+def handle_unexpected_exception(request: Request, exc: Exception) -> JSONResponse:
+    settings = getattr(request.app.state, "settings", None)
+    secret_values = settings.redaction_secret_values() if isinstance(settings, Settings) else ()
+    logger.error(
+        "Unhandled application error",
+        extra={
+            "error_type": type(exc).__name__,
+            "request_id": _request_id(request),
+            "traceback": redact_exception_traceback(exc, secret_values=secret_values),
+        },
+    )
+    return _error_response(
+        request,
+        status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+        code="internal_server_error",
+        message="An unexpected error occurred.",
+    )
 
 
 def register_exception_handlers(app: FastAPI) -> None:
@@ -69,6 +95,7 @@ def register_exception_handlers(app: FastAPI) -> None:
             code=exc.code,
             message=exc.message,
             details=exc.details,
+            headers=exc.headers,
         )
 
     @app.exception_handler(RequestValidationError)
@@ -110,16 +137,4 @@ def register_exception_handlers(app: FastAPI) -> None:
 
     @app.exception_handler(Exception)
     async def unhandled_error_handler(request: Request, exc: Exception) -> JSONResponse:
-        logger.exception(
-            "Unhandled application error",
-            extra={
-                "error_type": type(exc).__name__,
-                "request_id": _request_id(request),
-            },
-        )
-        return _error_response(
-            request,
-            status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
-            code="internal_server_error",
-            message="An unexpected error occurred.",
-        )
+        return handle_unexpected_exception(request, exc)
