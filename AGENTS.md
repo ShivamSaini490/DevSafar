@@ -27,3 +27,11 @@
 - After coding, run tests and report real results. Do not claim tests passed unless you ran them.
 - Explain every file in simple Hinglish.
 - Stop after the task. Do not start the next module.
+
+
+Build order: Foundation → Auth + OTP → Chat modes (saved/temporary) → LangGraph → Providers + RAG → Integration. Codex ko ye khud assume nahi karna.
+Trip start endpoint: sirf POST /conversations/{id}/messages (saved) aur POST /chat/temporary. Alag POST /trips/plan nahi banega.
+Response field names (canonical): route_legs, hotels, attractions, itinerary_days, transport_options, booking_links, data_sources. Ye Backend.pdf ke typed contract se hain. Baaki naam (routes, hotel_options, booking_options) use nahi honge.
+Auth: JWT cookie + auth_sessions approved. JWT mein sid aur jti rahenge, details Auth module ke prompt mein final karenge.
+LangGraph checkpoints: abhi defer, jab LangGraph module aayega tab decide.
+Temporary chat Redis state: Codex ki interpretation sahi hai (sirf TTL, koi PostgreSQL row, checkpoint ya trace nahi).
