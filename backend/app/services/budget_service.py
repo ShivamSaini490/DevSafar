@@ -1,19 +1,48 @@
+from datetime import datetime
+from decimal import ROUND_HALF_UP, Decimal
 
 from app.core.security import utc_now
 from app.schemas.attraction import AttractionOption
 from app.schemas.budget import BudgetBreakdown, BudgetCategory
 from app.schemas.hotel import HotelOption
 from app.schemas.transport import TransportOption
+from app.schemas.trip import TripRequirements
 from app.utils.currency_utils import all_amounts_known, sum_known_amounts
+
+
+def _priced_category(
+    *,
+    name: str,
+    amounts: list[Decimal | None],
+    fetched_at: datetime,
+) -> BudgetCategory:
+    if amounts and not all_amounts_known(amounts):
+        return BudgetCategory(
+            name=name,
+            amount=None,
+            price_type="unknown",
+            source="stub",
+            fetched_at=fetched_at,
+        )
+    return BudgetCategory(
+        name=name,
+        amount=sum_known_amounts(amounts),
+        price_type="estimate",
+        source="stub",
+        fetched_at=fetched_at,
+    )
 
 
 class BudgetService:
     @staticmethod
     def build(
         *,
+        requirements: TripRequirements,
         transport_options: list[TransportOption],
         hotels: list[HotelOption],
         attractions: list[AttractionOption],
+        food_per_day_per_traveler: Decimal | None = None,
+        buffer_percent: Decimal | None = None,
     ) -> BudgetBreakdown:
         priced_transport = [item.price.amount for item in transport_options]
         priced_hotels = [item.total_price.amount for item in hotels]
@@ -27,51 +56,70 @@ class BudgetService:
             utc_now(),
         )
         categories = [
-            BudgetCategory(
+            _priced_category(
                 name="Transport",
-                amount=sum_known_amounts(priced_transport),
-                price_type="estimate",
-                source="stub",
+                amounts=priced_transport,
                 fetched_at=fetched_at,
             ),
-            BudgetCategory(
+            _priced_category(
                 name="Hotels",
-                amount=sum_known_amounts(priced_hotels),
-                price_type="estimate",
-                source="stub",
+                amounts=priced_hotels,
                 fetched_at=fetched_at,
             ),
         ]
         if attractions:
-            if not all_amounts_known(attraction_prices):
-                categories.append(
-                    BudgetCategory(
-                        name="Attractions",
-                        amount=None,
-                        price_type="unknown",
-                        source="stub",
-                        fetched_at=fetched_at,
-                    )
+            categories.append(
+                _priced_category(
+                    name="Attractions",
+                    amounts=attraction_prices,
+                    fetched_at=fetched_at,
                 )
-            else:
-                categories.append(
-                    BudgetCategory(
-                        name="Attractions",
-                        amount=sum_known_amounts(attraction_prices),
-                        price_type="estimate",
-                        source="stub",
-                        fetched_at=fetched_at,
-                    )
+            )
+
+        if food_per_day_per_traveler is not None:
+            trip_days = (
+                (requirements.end_date - requirements.start_date).days + 1
+                if requirements.start_date is not None and requirements.end_date is not None
+                else 0
+            )
+            categories.append(
+                BudgetCategory(
+                    name="Food",
+                    amount=(food_per_day_per_traveler * trip_days * requirements.travelers),
+                    price_type="estimate",
+                    source="configured_rule",
+                    fetched_at=fetched_at,
                 )
-        if any(category.amount is None for category in categories):
+            )
+
+        if buffer_percent is not None:
+            subtotal_before_buffer = sum_known_amounts(category.amount for category in categories)
+            categories.append(
+                BudgetCategory(
+                    name="Buffer",
+                    amount=(subtotal_before_buffer * buffer_percent / Decimal("100")).quantize(
+                        Decimal("0.01"), rounding=ROUND_HALF_UP
+                    ),
+                    price_type="estimate",
+                    source="configured_rule",
+                    fetched_at=fetched_at,
+                )
+            )
+
+        known_subtotal = sum_known_amounts(category.amount for category in categories)
+        unknown_categories = [category.name for category in categories if category.amount is None]
+        if unknown_categories:
             return BudgetBreakdown(
                 total_estimated=None,
+                known_subtotal=known_subtotal,
+                unknown_categories=unknown_categories,
                 price_type="unknown",
                 categories=categories,
             )
-        total = sum_known_amounts(category.amount for category in categories)
         return BudgetBreakdown(
-            total_estimated=total,
+            total_estimated=known_subtotal,
+            known_subtotal=known_subtotal,
+            unknown_categories=[],
             price_type="estimate",
             categories=categories,
         )

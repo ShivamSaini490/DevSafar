@@ -1,4 +1,3 @@
-
 from datetime import datetime
 from decimal import Decimal
 from typing import Literal
@@ -15,6 +14,7 @@ class RouteLeg(StrictSchema):
     destination: str
     mode: TransportMode = "unknown"
     duration_minutes: int | None = Field(default=None, ge=0)
+    duration_source: str | None = None
     distance_km: Decimal | None = Field(default=None, ge=0)
     departure_at: datetime | None = None
     arrival_at: datetime | None = None

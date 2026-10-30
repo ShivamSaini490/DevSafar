@@ -1,4 +1,3 @@
-
 import asyncio
 from collections.abc import Callable
 from datetime import datetime
@@ -10,7 +9,7 @@ from langgraph.graph import END, START, StateGraph
 from app.agents.edges import after_intent, after_validation
 from app.agents.llm import GroqIntentModel, IntentModel, IntentModelFailure
 from app.agents.nodes.intent_node import build_intent_node
-from app.agents.nodes.planning_node import planning_node
+from app.agents.nodes.planning_node import build_planning_node
 from app.agents.nodes.research_node import build_research_node
 from app.agents.nodes.response_node import response_node
 from app.agents.nodes.validation_node import validation_node
@@ -49,13 +48,11 @@ class LangGraphTripPlanner:
         workflow = StateGraph(TravelState)
         workflow.add_node("intent", build_intent_node(intent_model or GroqIntentModel(settings)))
         workflow.add_node("research", build_research_node(provider_factory))
-        workflow.add_node("planning", planning_node)
+        workflow.add_node("planning", build_planning_node(settings))
         workflow.add_node("validation", validation_node)
         workflow.add_node("response", response_node)
         workflow.add_edge(START, "intent")
-        workflow.add_conditional_edges(
-            "intent", after_intent, {"research": "research", "end": END}
-        )
+        workflow.add_conditional_edges("intent", after_intent, {"research": "research", "end": END})
         workflow.add_edge("research", "planning")
         workflow.add_edge("planning", "validation")
         workflow.add_conditional_edges(
@@ -88,6 +85,7 @@ class LangGraphTripPlanner:
             "itinerary": [],
             "budget_breakdown": None,
             "validation_errors": [],
+            "feasible": None,
             "warnings": [],
             "retry_count": 0,
             "status": "completed",

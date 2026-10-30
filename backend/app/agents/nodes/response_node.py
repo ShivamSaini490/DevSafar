@@ -1,4 +1,3 @@
-
 from typing import Any
 from uuid import uuid4
 
@@ -14,14 +13,12 @@ async def response_node(state: TravelState) -> dict[str, Any]:
     errors = state["validation_errors"]
     warnings = [*state["warnings"], *errors]
     if errors:
-        warnings.append(
-            "Safer alternative: increase the budget or relax the return deadline."
-        )
+        warnings.append("Safer alternative: increase the budget or relax the return deadline.")
     response = TripResponse(
         trip_id=uuid4(),
         status="failed" if errors else "completed",
         requirements=requirements,
-        feasible=not errors,
+        feasible=state["feasible"],
         warnings=list(dict.fromkeys(warnings)),
         route_legs=state["route_options"],
         transport_options=state["transport_options"],

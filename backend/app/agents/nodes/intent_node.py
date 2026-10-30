@@ -63,7 +63,7 @@ def build_intent_node(intent_model: IntentModel) -> Any:
                 trip_id=uuid4(),
                 status="needs_clarification",
                 requirements=requirements,
-                feasible=False,
+                feasible=None,
                 warnings=questions,
                 route_legs=[],
                 transport_options=[],

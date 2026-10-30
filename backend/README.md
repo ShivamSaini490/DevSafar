@@ -99,3 +99,5 @@ tracing at graph invocation. Trace tags contain only `saved_chat`; metadata cont
 the opaque conversation ID, while input/output masking hooks replace traced payloads.
 Application logs use the existing redaction rules and never include user prompts or raw
 secrets in planning-failure diagnostics.
+
+- .env.example must contain only empty or placeholder values. Never copy values from backend/.env.

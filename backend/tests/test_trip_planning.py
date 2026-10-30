@@ -305,12 +305,56 @@ async def test_realistic_groq_json_normalizes_full_example_prompt(
     assert response.status_code == 201, response.text
     trip = response.json()["trip"]
     assert trip["status"] == "completed"
-    assert trip["feasible"] is True
-    assert trip["route_legs"]
+    assert trip["feasible"] is None
+    assert len(trip["route_legs"]) == 3
+    assert [(leg["origin"], leg["destination"]) for leg in trip["route_legs"]] == [
+        ("Hyderabad", "Puducherry"),
+        ("Puducherry", "Rameswaram"),
+        ("Rameswaram", "Hyderabad"),
+    ]
+    assert all(leg["mode"] for leg in trip["route_legs"])
+    assert all(leg["duration_minutes"] for leg in trip["route_legs"])
+    assert all(leg["departure_at"] for leg in trip["route_legs"])
+    assert all(leg["arrival_at"] for leg in trip["route_legs"])
+    assert all(
+        current["departure_at"] >= previous["arrival_at"]
+        for previous, current in zip(trip["route_legs"], trip["route_legs"][1:], strict=False)
+    )
     assert trip["itinerary_days"]
     assert trip["budget"]["categories"]
+    assert trip["budget"]["known_subtotal"] == "10500.00"
+    assert trip["budget"]["unknown_categories"] == ["Attractions"]
     assert "Travelers not specified; assuming 1." in trip["warnings"]
     assert "Return deadline timezone assumed Asia/Kolkata." in trip["warnings"]
+    assert (
+        "Feasibility cannot be verified: transport times are unverified/stub." in trip["warnings"]
+    )
+
+    arrivals = {leg["destination"]: leg["arrival_at"] for leg in trip["route_legs"]}
+    for day in trip["itinerary_days"]:
+        for activity in day["activities"]:
+            if activity["location"] in arrivals:
+                assert activity["starts_at"] >= arrivals[activity["location"]]
+    return_arrival = trip["route_legs"][-1]["arrival_at"]
+    return_day = next(day for day in trip["itinerary_days"] if day["date"] == return_arrival[:10])
+    assert return_day["destination"] == "Hyderabad"
+    assert any(activity["title"] == "Arrive in Hyderabad" for activity in return_day["activities"])
+
+    for hotel in trip["hotels"]:
+        assert hotel["destination"] != "Hyderabad"
+        arrival_leg = next(
+            leg for leg in trip["route_legs"] if leg["destination"] == hotel["destination"]
+        )
+        departure_leg = next(
+            leg for leg in trip["route_legs"] if leg["origin"] == hotel["destination"]
+        )
+        assert hotel["check_in"] == arrival_leg["arrival_at"][:10]
+        assert hotel["check_out"] == departure_leg["departure_at"][:10]
+    ordered_hotels = sorted(trip["hotels"], key=lambda hotel: hotel["check_in"])
+    assert all(
+        current["check_in"] >= previous["check_out"]
+        for previous, current in zip(ordered_hotels, ordered_hotels[1:], strict=False)
+    )
     prices = [
         *(leg["price"] for leg in trip["route_legs"]),
         *(option["price"] for option in trip["transport_options"]),

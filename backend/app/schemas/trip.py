@@ -1,4 +1,3 @@
-
 from datetime import date, datetime
 from decimal import Decimal
 from typing import Literal
@@ -57,7 +56,7 @@ class TripResponse(StrictSchema):
     trip_id: UUID
     status: TripStatus
     requirements: TripRequirements
-    feasible: bool
+    feasible: bool | None
     warnings: list[str] = Field(default_factory=list)
     route_legs: list[RouteLeg] = Field(default_factory=list)
     transport_options: list[TransportOption] = Field(default_factory=list)

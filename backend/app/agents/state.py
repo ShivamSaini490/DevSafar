@@ -1,4 +1,3 @@
-
 from datetime import datetime
 from typing import TypedDict
 from uuid import UUID
@@ -25,6 +24,7 @@ class TravelState(TypedDict):
     itinerary: list[ItineraryDay]
     budget_breakdown: BudgetBreakdown | None
     validation_errors: list[str]
+    feasible: bool | None
     warnings: list[str]
     retry_count: int
     status: TripStatus

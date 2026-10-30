@@ -1,4 +1,3 @@
-
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from decimal import Decimal
@@ -9,6 +8,7 @@ from app.schemas.common import DataSource, PriceQuote, PriceType
 from app.schemas.hotel import HotelOption
 from app.schemas.transport import RouteLeg, TransportOption
 from app.schemas.trip import TripRequirements
+from app.services.route_service import ordered_route_stops
 
 
 class MapsProvider(Protocol):
@@ -16,9 +16,7 @@ class MapsProvider(Protocol):
 
 
 class TransportProvider(Protocol):
-    async def options(
-        self, requirements: TripRequirements
-    ) -> list[TransportOption]: ...
+    async def options(self, requirements: TripRequirements) -> list[TransportOption]: ...
 
 
 class HotelProvider(Protocol):
@@ -26,9 +24,7 @@ class HotelProvider(Protocol):
 
 
 class PlacesProvider(Protocol):
-    async def attractions(
-        self, requirements: TripRequirements
-    ) -> list[AttractionOption]: ...
+    async def attractions(self, requirements: TripRequirements) -> list[AttractionOption]: ...
 
 
 class StubMapsProvider:
@@ -38,13 +34,14 @@ class StubMapsProvider:
     async def route_legs(self, requirements: TripRequirements) -> list[RouteLeg]:
         if requirements.origin is None:
             return []
-        stops = [requirements.origin, *requirements.destinations]
+        stops = ordered_route_stops(requirements)
         return [
             RouteLeg(
                 origin=origin,
                 destination=destination,
                 mode="unknown",
                 duration_minutes=480,
+                duration_source="stub",
                 distance_km=None,
                 price=PriceQuote(
                     amount=None,
@@ -64,7 +61,7 @@ class StubTransportProvider:
     async def options(self, requirements: TripRequirements) -> list[TransportOption]:
         if requirements.origin is None:
             return []
-        stops = [requirements.origin, *requirements.destinations]
+        stops = ordered_route_stops(requirements)
         return [
             TransportOption(
                 origin=origin,
@@ -129,9 +126,7 @@ class StubPlacesProvider:
     def __init__(self, fetched_at: datetime) -> None:
         self.fetched_at = fetched_at
 
-    async def attractions(
-        self, requirements: TripRequirements
-    ) -> list[AttractionOption]:
+    async def attractions(self, requirements: TripRequirements) -> list[AttractionOption]:
         return [
             AttractionOption(
                 destination=destination,

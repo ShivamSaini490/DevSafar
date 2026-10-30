@@ -1,9 +1,21 @@
-
 from typing import Any
 
 from app.agents.state import TravelState
 from app.services.itinerary_service import ItineraryService
-from app.utils.currency_utils import sum_known_amounts
+
+UNVERIFIED_TIMES_WARNING = "Feasibility cannot be verified: transport times are unverified/stub."
+
+
+def _has_verified_durations(state: TravelState) -> bool:
+    legs = state["route_options"]
+    return bool(legs) and all(
+        leg.duration_minutes is not None
+        and leg.departure_at is not None
+        and leg.arrival_at is not None
+        and leg.duration_source is not None
+        and not leg.duration_source.casefold().startswith("stub")
+        for leg in legs
+    )
 
 
 async def validation_node(state: TravelState) -> dict[str, Any]:
@@ -19,16 +31,20 @@ async def validation_node(state: TravelState) -> dict[str, Any]:
         and requirements.end_date < requirements.start_date
     ):
         errors.append("Trip end date is before the start date.")
-    planned_return = ItineraryService.planned_return_at(requirements)
+
+    return_arrival = ItineraryService.planned_return_at(
+        requirements,
+        state["route_options"],
+    )
     if (
-        planned_return is not None
+        return_arrival is not None
         and requirements.return_deadline is not None
-        and planned_return > requirements.return_deadline
+        and return_arrival > requirements.return_deadline
     ):
-        errors.append("The planned return misses the required return deadline.")
-    known_total = sum_known_amounts(category.amount for category in budget.categories)
-    if requirements.budget is not None and known_total > requirements.budget:
-        errors.append("Known estimated costs exceed the requested budget.")
+        errors.append("The computed return arrival misses the required return deadline.")
+    if requirements.budget is not None and budget.known_subtotal > requirements.budget:
+        errors.append("Known subtotal already exceeds the requested budget.")
+
     all_prices = [
         *(leg.price for leg in state["route_options"]),
         *(option.price for option in state["transport_options"]),
@@ -39,11 +55,26 @@ async def validation_node(state: TravelState) -> dict[str, Any]:
     if any(price.price_type == "unknown" for price in all_prices):
         warnings.append("Some prices are unknown and must be verified before booking.")
     if any(
-        price.price_type == "live_quote" and price.source == "stub"
-        for price in all_prices
+        price.price_type == "live_quote" and price.source.startswith("stub") for price in all_prices
     ):
         errors.append("Stub data cannot be labelled as a live quote.")
+
+    verified_durations = _has_verified_durations(state)
+    if errors:
+        feasible: bool | None = False
+    elif (
+        verified_durations
+        and return_arrival is not None
+        and requirements.return_deadline is not None
+        and return_arrival <= requirements.return_deadline
+    ):
+        feasible = True
+    else:
+        feasible = None
+        if not verified_durations:
+            warnings.append(UNVERIFIED_TIMES_WARNING)
     return {
         "validation_errors": list(dict.fromkeys(errors)),
+        "feasible": feasible,
         "warnings": list(dict.fromkeys(warnings)),
     }

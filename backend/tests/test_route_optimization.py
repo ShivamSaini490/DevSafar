@@ -1,4 +1,3 @@
-
 from datetime import datetime
 from decimal import Decimal
 
@@ -34,9 +33,9 @@ def test_budget_categories_sum_exactly_with_decimal() -> None:
         price_type="estimate",
         categories=categories,
     )
-    assert sum_known_amounts(item.amount for item in budget.categories) == (
-        budget.total_estimated
-    )
+    assert sum_known_amounts(item.amount for item in budget.categories) == (budget.total_estimated)
+    assert budget.known_subtotal == Decimal("10000.00")
+    assert budget.unknown_categories == []
 
 
 def test_unknown_prices_are_null_and_cannot_be_zero() -> None:

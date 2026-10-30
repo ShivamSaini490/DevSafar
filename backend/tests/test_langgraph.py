@@ -47,6 +47,15 @@ async def test_example_prompt_maps_to_canonical_typed_response(
     assert response.requirements.return_deadline is not None
     assert response.requirements.return_deadline.utcoffset().total_seconds() == 19_800
     assert response.requirements.budget == 15_000
+    assert response.feasible is None
+    assert len(response.route_legs) == 3
+    assert response.route_legs[-1].destination == "Hyderabad"
+    assert all(leg.departure_at is not None for leg in response.route_legs)
+    assert all(leg.arrival_at is not None for leg in response.route_legs)
+    assert all(leg.duration_source == "stub" for leg in response.route_legs)
+    assert (
+        "Feasibility cannot be verified: transport times are unverified/stub." in response.warnings
+    )
     assert TripResponse.model_validate(response.model_dump()) == response
     assert set(response.model_dump()) == {
         "trip_id",
@@ -84,7 +93,7 @@ async def test_missing_critical_info_ends_before_research(settings: Settings) ->
         chat_mode="temporary",
     )
     assert response.status == "needs_clarification"
-    assert response.feasible is False
+    assert response.feasible is None
     assert response.route_legs == []
     assert response.data_sources == []
     assert response.warnings == [
@@ -120,6 +129,7 @@ async def test_ambiguities_alone_do_not_block_planning(settings: Settings) -> No
     )
 
     assert response.status == "completed"
+    assert response.feasible is None
     assert response.route_legs
     assert response.itinerary_days
     assert response.requirements.travelers == 1
@@ -148,17 +158,26 @@ async def test_missing_budget_and_deadline_warn_but_continue(settings: Settings)
     )
 
     assert response.status == "completed"
-    assert response.feasible is True
+    assert response.feasible is None
     assert response.route_legs
     assert response.itinerary_days
     assert "Budget not specified; planning with budget unknown." in response.warnings
     assert "Return deadline not specified; deadline validation skipped." in response.warnings
+    assert (
+        "Feasibility cannot be verified: transport times are unverified/stub." in response.warnings
+    )
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("prompt", ["deadline miss", "impossible budget"])
+@pytest.mark.parametrize(
+    ("prompt", "reason"),
+    [
+        ("deadline miss", "computed return arrival misses"),
+        ("impossible budget", "Known subtotal already exceeds"),
+    ],
+)
 async def test_deterministic_validation_marks_impossible_plans_infeasible(
-    settings: Settings, prompt: str
+    settings: Settings, prompt: str, reason: str
 ) -> None:
     planner = LangGraphTripPlanner(settings, intent_model=FakeIntentModel())
     response = await planner.run(
@@ -169,6 +188,7 @@ async def test_deterministic_validation_marks_impossible_plans_infeasible(
     )
     assert response.feasible is False
     assert response.status == "failed"
+    assert any(reason in warning for warning in response.warnings)
     assert any("Safer alternative" in warning for warning in response.warnings)
 
 

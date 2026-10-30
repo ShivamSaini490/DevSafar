@@ -1,4 +1,3 @@
-
 from dataclasses import dataclass
 from uuid import UUID
 
@@ -23,11 +22,15 @@ class SavedChatTurn:
 def summarize_trip(response: TripResponse) -> str:
     if response.status == "needs_clarification":
         return "I need a few details before planning: " + " ".join(response.warnings)
-    if response.feasible:
+    if response.feasible is True:
         return "A source-labelled draft trip plan is ready. Verify unknown prices before booking."
-    return "This plan is not feasible with the current constraints. " + " ".join(
-        response.warnings
-    )
+    if response.feasible is None:
+        return (
+            "A source-labelled draft trip plan is ready. "
+            "Feasibility cannot yet be verified. "
+            + " ".join(response.warnings)
+        )
+    return "This plan is not feasible with the current constraints. " + " ".join(response.warnings)
 
 
 class ChatService:

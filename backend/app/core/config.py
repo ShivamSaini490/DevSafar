@@ -1,5 +1,6 @@
 import os
 import secrets
+from decimal import Decimal
 from functools import lru_cache
 from pathlib import Path
 from typing import Literal
@@ -49,6 +50,17 @@ class Settings(BaseSettings):
     groq_model: str = "llama-3.3-70b-versatile"
     groq_timeout_seconds: float = Field(default=30.0, gt=0, le=60)
     graph_timeout_seconds: float = Field(default=60.0, gt=0, le=180)
+    food_estimate_per_day_per_traveler: Decimal | None = Field(
+        default=None,
+        ge=0,
+        description="Optional INR food estimate per trip day per traveler.",
+    )
+    budget_buffer_percent: Decimal | None = Field(
+        default=None,
+        ge=0,
+        le=100,
+        description="Optional buffer percentage applied to the known subtotal.",
+    )
     qdrant_url: str | None = None
     qdrant_api_key: SecretStr | None = None
 
@@ -145,10 +157,7 @@ class Settings(BaseSettings):
 
     @property
     def groq_configured(self) -> bool:
-        return bool(
-            self.groq_api_key is not None
-            and self.groq_api_key.get_secret_value().strip()
-        )
+        return bool(self.groq_api_key is not None and self.groq_api_key.get_secret_value().strip())
 
     def redaction_secret_values(self) -> tuple[str, ...]:
         optional_secrets = (
