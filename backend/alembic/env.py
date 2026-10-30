@@ -7,7 +7,7 @@ from sqlalchemy.ext.asyncio import async_engine_from_config
 from alembic import context
 from app.core.config import get_settings
 from app.db.base import Base
-from app.models import AuthSession, PasswordResetOtp, User
+from app.models import AuthSession, Conversation, Message, PasswordResetOtp, User
 
 config = context.config
 if config.config_file_name is not None:
@@ -15,7 +15,7 @@ if config.config_file_name is not None:
 
 config.set_main_option("sqlalchemy.url", get_settings().database_url.replace("%", "%%"))
 target_metadata = Base.metadata
-_models = (AuthSession, PasswordResetOtp, User)
+_models = (AuthSession, Conversation, Message, PasswordResetOtp, User)
 
 
 def run_migrations_offline() -> None:

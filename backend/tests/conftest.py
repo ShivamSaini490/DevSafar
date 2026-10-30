@@ -69,6 +69,9 @@ def _settings() -> Settings:
         otp_request_rate_limit_per_email=20,
         otp_verify_rate_limit_per_ip=30,
         otp_verify_rate_limit_per_email=30,
+        temporary_chat_rate_limit_per_ip=100,
+        temporary_chat_rate_limit_per_session=100,
+        cleanup_enabled=False,
     )
 
 

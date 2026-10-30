@@ -1,4 +1,4 @@
-# DevSafar Backend - Foundation + Auth/OTP
+# DevSafar Backend - Foundation + Auth/OTP + Chat Modes
 
 Python 3.12 FastAPI foundation with async PostgreSQL, Redis, versioned health routes,
 safe error responses, structured redacted logs, Docker, and tests.
@@ -13,6 +13,22 @@ Set a persistent, random `SECRET_KEY` in the local environment for stable develo
 sessions. If it is absent only in `development`, the app generates a process-local key and
 logs a warning; all sessions then become invalid after restart. Staging and production
 still refuse to start without an explicitly configured key.
+
+Saved conversations are available only to authenticated owners. Their expiry is fixed
+at creation time plus seven days and is never refreshed by activity; every chat and
+message query also rejects expired records before scheduled cleanup runs.
+
+Temporary chat stores only bounded Redis context for 30 minutes (refreshed per turn) and
+never creates PostgreSQL rows or LangSmith traces. On the first turn the API returns an
+opaque `temp_token` response field. The frontend must keep that token and its random
+`temp_session_id` only in tab memory and send both on later turns. A cookie is deliberately
+not used because cookies are shared across browser tabs; the Redis key is an HMAC of both
+values, and neither raw value is used as a key or logged. The endpoint returns the clearly
+labelled placeholder `AI planning not connected yet` until the LangGraph module is built.
+
+Expired-chat cleanup runs from the FastAPI lifespan every 15 minutes by default. It can be
+configured with `CLEANUP_INTERVAL_SECONDS` and `CLEANUP_BATCH_SIZE`, or disabled with
+`CLEANUP_ENABLED=false` (the integration test app does this explicitly).
 
 ## Local setup
 
@@ -30,6 +46,12 @@ still refuse to start without an explicitly configured key.
    ```powershell
    python -m pip install -r requirements.txt
    uvicorn app.main:app --reload
+   ```
+
+   Apply migrations before starting the API; tables are never created with `create_all`:
+
+   ```powershell
+   alembic upgrade head
    ```
 
 4. Verify:

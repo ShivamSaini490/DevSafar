@@ -1,6 +1,7 @@
+import asyncio
 import logging
 from collections.abc import AsyncIterator, Callable
-from contextlib import AbstractAsyncContextManager, asynccontextmanager
+from contextlib import AbstractAsyncContextManager, asynccontextmanager, suppress
 from uuid import uuid4
 
 from fastapi import FastAPI, Request
@@ -12,6 +13,7 @@ from app.core.config import Settings, get_settings
 from app.core.exceptions import handle_unexpected_exception, register_exception_handlers
 from app.core.logging import configure_logging
 from app.db.session import create_db_engine, create_redis_client, create_session_factory
+from app.tasks.cleanup_tasks import run_cleanup_loop
 
 logger = logging.getLogger(__name__)
 
@@ -54,12 +56,23 @@ def _lifespan(settings: Settings) -> Callable[[FastAPI], AbstractAsyncContextMan
 
         app.state.settings = settings
         app.state.db_engine = engine
-        app.state.db_session_factory = create_session_factory(engine)
+        session_factory = create_session_factory(engine)
+        app.state.db_session_factory = session_factory
         app.state.redis = redis
+        cleanup_task: asyncio.Task[None] | None = None
+        if settings.cleanup_enabled:
+            cleanup_task = asyncio.create_task(
+                run_cleanup_loop(session_factory, settings),
+                name="expired-conversation-cleanup",
+            )
 
         try:
             yield
         finally:
+            if cleanup_task is not None:
+                cleanup_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await cleanup_task
             await redis.aclose()
             await engine.dispose()
 

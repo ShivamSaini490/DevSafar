@@ -9,6 +9,7 @@ from app.db.base import Base
 
 if TYPE_CHECKING:
     from app.models.auth_session import AuthSession
+    from app.models.conversation import Conversation
     from app.models.password_reset_otp import PasswordResetOtp
 
 
@@ -30,4 +31,7 @@ class User(Base):
     )
     password_reset_otp: Mapped["PasswordResetOtp | None"] = relationship(
         back_populates="user", cascade="all, delete-orphan", uselist=False
+    )
+    conversations: Mapped[list["Conversation"]] = relationship(
+        back_populates="owner", cascade="all, delete-orphan", passive_deletes=True
     )

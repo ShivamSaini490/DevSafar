@@ -72,6 +72,17 @@ class Settings(BaseSettings):
     otp_verify_rate_limit_per_email: int = Field(default=10, ge=1)
     otp_verify_rate_limit_window_seconds: int = Field(default=300, ge=1)
 
+    temporary_chat_ttl_seconds: int = Field(default=1800, ge=1, le=86400)
+    temporary_chat_max_messages: int = Field(default=20, ge=2, le=100)
+    temporary_chat_max_bytes: int = Field(default=65536, ge=8192, le=262144)
+    temporary_chat_rate_limit_per_ip: int = Field(default=30, ge=1)
+    temporary_chat_rate_limit_per_session: int = Field(default=20, ge=1)
+    temporary_chat_rate_limit_window_seconds: int = Field(default=60, ge=1)
+
+    cleanup_enabled: bool = True
+    cleanup_interval_seconds: int = Field(default=900, ge=1)
+    cleanup_batch_size: int = Field(default=100, ge=1, le=1000)
+
     langsmith_tracing: bool = False
     langsmith_api_key: SecretStr | None = None
     langsmith_project: str = "devsafar"

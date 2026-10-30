@@ -77,6 +77,22 @@ async def require_csrf(
     return context
 
 
+async def require_csrf_if_authenticated(
+    request: Request,
+    db: Annotated[AsyncSession, Depends(get_db_session)],
+    csrf_header: Annotated[str | None, Header(alias="X-CSRF-Token")] = None,
+) -> AuthContext | None:
+    """Allow guests, but require a valid session and CSRF token when auth cookie exists."""
+    settings = get_request_settings(request)
+    if settings.access_token_cookie_name not in request.cookies:
+        return None
+    context = await get_auth_context(request, db)
+    csrf_cookie = request.cookies.get(settings.csrf_cookie_name)
+    if not csrf_cookie or not csrf_header or not hmac.compare_digest(csrf_cookie, csrf_header):
+        raise AppError(403, "csrf_validation_failed", "CSRF validation failed.")
+    return context
+
+
 async def postgres_is_ready(request: Request) -> bool:
     engine: AsyncEngine = request.app.state.db_engine
     try:
