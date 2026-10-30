@@ -9,6 +9,8 @@ from pydantic import Field, PrivateAttr, SecretStr, field_validator, model_valid
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy.engine import URL
 
+from app.utils.url_validator import parse_host_allowlist, validate_external_base_url
+
 BACKEND_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_ENV_FILE = BACKEND_ROOT / ".env"
 
@@ -50,6 +52,22 @@ class Settings(BaseSettings):
     groq_model: str = "llama-3.3-70b-versatile"
     groq_timeout_seconds: float = Field(default=30.0, gt=0, le=60)
     graph_timeout_seconds: float = Field(default=60.0, gt=0, le=180)
+    maps_provider: Literal["stub", "osm"] = "stub"
+    osrm_base_url: str = "https://router.project-osrm.org"
+    nominatim_base_url: str = "https://nominatim.openstreetmap.org"
+    nominatim_user_agent: str = Field(
+        default="DevSafar/0.1 road-routing-backend",
+        min_length=10,
+        max_length=200,
+    )
+    nominatim_country_code: str = Field(default="in", pattern=r"^[a-zA-Z]{2}$")
+    maps_allowed_hosts: str = (
+        "router.project-osrm.org,nominatim.openstreetmap.org"
+    )
+    maps_http_timeout_seconds: float = Field(default=10.0, gt=0, le=60)
+    geocode_cache_ttl_seconds: int = Field(default=2_592_000, ge=86_400)
+    fuel_cost_per_km: Decimal = Field(default=Decimal("12.00"), gt=0)
+    max_driving_hours_per_day: int = Field(default=10, ge=1, le=16)
     food_estimate_per_day_per_traveler: Decimal | None = Field(
         default=None,
         ge=0,
@@ -124,7 +142,20 @@ class Settings(BaseSettings):
             self._uses_ephemeral_auth_secret = True
         if self.environment != "development" and self.dev_otp_email_fallback_enabled:
             raise ValueError("DEV_OTP_EMAIL_FALLBACK_ENABLED is development-only")
+        allowed_hosts = parse_host_allowlist(self.maps_allowed_hosts)
+        self.osrm_base_url = validate_external_base_url(
+            self.osrm_base_url,
+            allowed_hosts=allowed_hosts,
+        )
+        self.nominatim_base_url = validate_external_base_url(
+            self.nominatim_base_url,
+            allowed_hosts=allowed_hosts,
+        )
         return self
+
+    @property
+    def maps_host_allowlist(self) -> frozenset[str]:
+        return parse_host_allowlist(self.maps_allowed_hosts)
 
     @property
     def database_url(self) -> str:

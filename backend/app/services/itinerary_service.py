@@ -40,6 +40,11 @@ class ItineraryService:
                         f"Arrival after {leg.duration_minutes} minutes of "
                         f"{leg.mode} travel; duration source: "
                         f"{leg.duration_source or 'unverified'}."
+                        + (
+                            f" Includes {leg.overnight_stops} overnight driving rest stop(s)."
+                            if leg.overnight_stops
+                            else ""
+                        )
                     ),
                 )
             )
@@ -61,7 +66,7 @@ class ItineraryService:
                         location=leg.destination,
                         starts_at=activity_start,
                         ends_at=activity_end,
-                        notes="Placeholder schedule; providers are not connected.",
+                        notes="Draft activity after arrival; local details are not connected.",
                     )
                 )
                 destination_by_date[activity_start.date()] = leg.destination

@@ -18,6 +18,7 @@ class RouteLeg(StrictSchema):
     distance_km: Decimal | None = Field(default=None, ge=0)
     departure_at: datetime | None = None
     arrival_at: datetime | None = None
+    overnight_stops: int = Field(default=0, ge=0)
     price: PriceQuote
 
 

@@ -2,8 +2,10 @@ import asyncio
 import logging
 from collections.abc import AsyncIterator, Callable
 from contextlib import AbstractAsyncContextManager, asynccontextmanager, suppress
+from datetime import datetime
 from uuid import uuid4
 
+import httpx
 from fastapi import FastAPI, Request
 from starlette.datastructures import MutableHeaders
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
@@ -14,6 +16,8 @@ from app.core.config import Settings, get_settings
 from app.core.exceptions import handle_unexpected_exception, register_exception_handlers
 from app.core.logging import configure_logging
 from app.db.session import create_db_engine, create_redis_client, create_session_factory
+from app.integrations.base import ProviderBundle
+from app.integrations.maps_provider import OsmMapsProvider
 from app.tasks.cleanup_tasks import run_cleanup_loop
 
 logger = logging.getLogger(__name__)
@@ -60,8 +64,29 @@ def _lifespan(settings: Settings) -> Callable[[FastAPI], AbstractAsyncContextMan
         session_factory = create_session_factory(engine)
         app.state.db_session_factory = session_factory
         app.state.redis = redis
+        maps_http_client: httpx.AsyncClient | None = None
         if not hasattr(app.state, "trip_planner"):
-            app.state.trip_planner = LangGraphTripPlanner(settings)
+            if settings.maps_provider == "osm":
+                http_client = httpx.AsyncClient()
+                maps_http_client = http_client
+                osm_maps_provider = OsmMapsProvider(
+                    settings,
+                    redis,
+                    client=http_client,
+                )
+
+                def provider_factory(fetched_at: datetime) -> ProviderBundle:
+                    return ProviderBundle.stubs(fetched_at).with_maps(
+                        osm_maps_provider,
+                        source_name="osrm",
+                    )
+
+                app.state.trip_planner = LangGraphTripPlanner(
+                    settings,
+                    provider_factory=provider_factory,
+                )
+            else:
+                app.state.trip_planner = LangGraphTripPlanner(settings)
         cleanup_task: asyncio.Task[None] | None = None
         if settings.cleanup_enabled:
             cleanup_task = asyncio.create_task(
@@ -76,6 +101,8 @@ def _lifespan(settings: Settings) -> Callable[[FastAPI], AbstractAsyncContextMan
                 cleanup_task.cancel()
                 with suppress(asyncio.CancelledError):
                     await cleanup_task
+            if maps_http_client is not None:
+                await maps_http_client.aclose()
             await redis.aclose()
             await engine.dispose()
 

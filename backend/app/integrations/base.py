@@ -151,6 +151,7 @@ class ProviderBundle:
     transport: TransportProvider
     hotels: HotelProvider
     places: PlacesProvider
+    maps_source_name: str
 
     @classmethod
     def stubs(cls, fetched_at: datetime) -> "ProviderBundle":
@@ -159,12 +160,23 @@ class ProviderBundle:
             transport=StubTransportProvider(fetched_at),
             hotels=StubHotelProvider(fetched_at),
             places=StubPlacesProvider(fetched_at),
+            maps_source_name="stub_maps",
+        )
+
+    def with_maps(self, maps: MapsProvider, *, source_name: str) -> "ProviderBundle":
+        return ProviderBundle(
+            maps=maps,
+            transport=self.transport,
+            hotels=self.hotels,
+            places=self.places,
+            maps_source_name=source_name,
         )
 
 
-def stub_sources(fetched_at: datetime) -> list[DataSource]:
+def provider_sources(bundle: ProviderBundle, fetched_at: datetime) -> list[DataSource]:
+    maps_price_type: PriceType = "estimate" if bundle.maps_source_name == "osrm" else "unknown"
     sources: tuple[tuple[str, PriceType], ...] = (
-        ("stub_maps", "unknown"),
+        (bundle.maps_source_name, maps_price_type),
         ("stub_transport", "estimate"),
         ("stub_hotels", "estimate"),
         ("stub_places", "unknown"),
