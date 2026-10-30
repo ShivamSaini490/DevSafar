@@ -1,6 +1,7 @@
 import os
 from collections.abc import AsyncIterator, Iterator
-from datetime import datetime
+from datetime import date, datetime
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
@@ -18,6 +19,51 @@ os.environ["ENVIRONMENT"] = "test"
 
 from app.core.config import Settings  # noqa: E402
 from app.db.session import create_db_engine, create_session_factory  # noqa: E402
+from app.schemas.trip import TripRequirements, TripResponse  # noqa: E402
+from app.utils.datetime_utils import INDIA_TIME_ZONE  # noqa: E402
+
+
+class FakeIntentModel:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, TripResponse | None]] = []
+
+    async def extract_requirements(
+        self, *, user_prompt: str, previous_trip: TripResponse | None
+    ) -> TripRequirements:
+        self.calls.append((user_prompt, previous_trip))
+        lowered = user_prompt.casefold()
+        if "missing critical" in lowered:
+            return TripRequirements(
+                origin=None,
+                destinations=[],
+                start_date=None,
+                end_date=None,
+                ambiguities=["Origin, destinations, and dates are missing."],
+            )
+        if previous_trip is not None and "budget kam" in lowered:
+            return previous_trip.requirements.model_copy(
+                deep=True, update={"budget": Decimal("5000")}
+            )
+        requirements = TripRequirements(
+            origin="Hyderabad",
+            destinations=["Pondicherry", "Rameshwaram", "Hyderabad"],
+            start_date=date(2026, 10, 30),
+            end_date=date(2026, 11, 1),
+            travelers=1,
+            budget=Decimal("15000"),
+            return_deadline=datetime(
+                2026, 11, 2, 10, 0, tzinfo=INDIA_TIME_ZONE
+            ),
+            preferences=[],
+            ambiguities=[],
+        )
+        if "deadline miss" in lowered:
+            requirements.return_deadline = datetime(
+                2026, 11, 1, 10, 0, tzinfo=INDIA_TIME_ZONE
+            )
+        if "impossible budget" in lowered:
+            requirements.budget = Decimal("100")
+        return requirements
 
 
 class FakeEmailSender:
@@ -99,10 +145,20 @@ def settings() -> Settings:
 
 
 @pytest.fixture
-def app(settings: Settings) -> FastAPI:
+def fake_intent_model() -> FakeIntentModel:
+    return FakeIntentModel()
+
+
+@pytest.fixture
+def app(settings: Settings, fake_intent_model: FakeIntentModel) -> FastAPI:
+    from app.agents.graph import LangGraphTripPlanner
     from app.main import create_app
 
-    return create_app(settings)
+    application = create_app(settings)
+    application.state.trip_planner = LangGraphTripPlanner(
+        settings, intent_model=fake_intent_model
+    )
+    return application
 
 
 @pytest_asyncio.fixture(autouse=True)

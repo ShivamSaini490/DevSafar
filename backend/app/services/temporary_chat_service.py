@@ -8,10 +8,13 @@ from typing import Literal, TypedDict, cast
 
 from redis.asyncio import Redis
 
+from app.agents.graph import TripPlanner
 from app.core.config import Settings
-from app.core.constants import PLACEHOLDER_ASSISTANT_REPLY
 from app.core.exceptions import AppError
 from app.core.rate_limiter import RateLimitRule, enforce_rate_limit
+from app.core.tracing import temporary_chat_tracing_enabled
+from app.schemas.trip import TripResponse
+from app.services.chat_service import summarize_trip
 
 TEMPORARY_CHAT_KEY_PREFIX = "devsafar:temp-chat:v1"
 
@@ -26,17 +29,14 @@ class TemporaryChatTurn:
     assistant_message: str
     issued_token: str | None
     context_message_count: int
-
-
-def temporary_chat_tracing_enabled(_settings: Settings) -> Literal[False]:
-    """Hard safety boundary for the future graph integration."""
-    return False
+    trip: TripResponse
 
 
 class TemporaryChatService:
-    def __init__(self, redis: Redis, settings: Settings) -> None:
+    def __init__(self, redis: Redis, settings: Settings, planner: TripPlanner) -> None:
         self.redis = redis
         self.settings = settings
+        self.planner = planner
 
     async def enforce_limits(self, *, client_ip: str, temp_session_id: str) -> None:
         window = self.settings.temporary_chat_rate_limit_window_seconds
@@ -73,29 +73,40 @@ class TemporaryChatService:
             temp_token = secrets.token_urlsafe(32)
             issued_token = temp_token
             messages: list[TemporaryMessage] = []
+            previous_trip: TripResponse | None = None
         else:
             raw_context = await self.redis.get(self._context_key(temp_session_id, temp_token))
             if raw_context is None:
                 raise AppError(404, "temporary_chat_not_found", "Temporary chat not found.")
-            messages = self._decode_context(cast(str, raw_context))
+            messages, previous_trip = self._decode_context(cast(str, raw_context))
+
+        temporary_chat_tracing_enabled(self.settings)
+        trip = await self.planner.run(
+            conversation_id=None,
+            user_prompt=content,
+            previous_trip=previous_trip,
+            chat_mode="temporary",
+        )
+        assistant_summary = summarize_trip(trip)
 
         messages.extend(
             (
                 TemporaryMessage(role="user", content=content),
-                TemporaryMessage(role="assistant", content=PLACEHOLDER_ASSISTANT_REPLY),
+                TemporaryMessage(role="assistant", content=assistant_summary),
             )
         )
-        messages = self._bounded_messages(messages)
-        serialized = self._serialize_context(messages)
+        messages = self._bounded_messages(messages, trip)
+        serialized = self._serialize_context(messages, trip)
         await self.redis.set(
             self._context_key(temp_session_id, temp_token),
             serialized,
             ex=self.settings.temporary_chat_ttl_seconds,
         )
         return TemporaryChatTurn(
-            assistant_message=PLACEHOLDER_ASSISTANT_REPLY,
+            assistant_message=assistant_summary,
             issued_token=issued_token,
             context_message_count=len(messages),
+            trip=trip,
         )
 
     def _context_key(self, temp_session_id: str, temp_token: str) -> str:
@@ -106,32 +117,47 @@ class TemporaryChatService:
         return f"{TEMPORARY_CHAT_KEY_PREFIX}:{digest}"
 
     def _bounded_messages(
-        self, messages: list[TemporaryMessage]
+        self, messages: list[TemporaryMessage], trip: TripResponse
     ) -> list[TemporaryMessage]:
         bounded = messages[-self.settings.temporary_chat_max_messages :]
         if bounded and bounded[0]["role"] == "assistant":
             bounded = bounded[1:]
-        while len(bounded) > 2 and len(self._serialize_context(bounded).encode()) > (
+        while len(bounded) > 2 and len(self._serialize_context(bounded, trip).encode()) > (
             self.settings.temporary_chat_max_bytes
         ):
             bounded = bounded[2:]
-        if len(self._serialize_context(bounded).encode()) > self.settings.temporary_chat_max_bytes:
+        if len(self._serialize_context(bounded, trip).encode()) > (
+            self.settings.temporary_chat_max_bytes
+        ):
             raise AppError(413, "temporary_chat_context_too_large", "Message is too large.")
         return bounded
 
     @staticmethod
-    def _serialize_context(messages: list[TemporaryMessage]) -> str:
-        return json.dumps({"messages": messages}, separators=(",", ":"), ensure_ascii=False)
+    def _serialize_context(
+        messages: list[TemporaryMessage], trip: TripResponse
+    ) -> str:
+        return json.dumps(
+            {
+                "messages": messages,
+                "previous_trip": trip.model_dump(mode="json"),
+            },
+            separators=(",", ":"),
+            ensure_ascii=False,
+        )
 
     @staticmethod
-    def _decode_context(raw_context: str) -> list[TemporaryMessage]:
+    def _decode_context(
+        raw_context: str,
+    ) -> tuple[list[TemporaryMessage], TripResponse | None]:
         try:
             decoded = json.loads(raw_context)
             messages = decoded["messages"]
             if not isinstance(messages, list):
                 raise TypeError
-            return cast(list[TemporaryMessage], messages)
-        except (json.JSONDecodeError, KeyError, TypeError) as exc:
+            previous = decoded.get("previous_trip")
+            trip = TripResponse.model_validate(previous) if previous is not None else None
+            return cast(list[TemporaryMessage], messages), trip
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
             raise AppError(
                 404, "temporary_chat_not_found", "Temporary chat not found."
             ) from exc

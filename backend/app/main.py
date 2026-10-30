@@ -8,6 +8,7 @@ from fastapi import FastAPI, Request
 from starlette.datastructures import MutableHeaders
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
+from app.agents.graph import LangGraphTripPlanner
 from app.api.router import api_router
 from app.core.config import Settings, get_settings
 from app.core.exceptions import handle_unexpected_exception, register_exception_handlers
@@ -59,6 +60,8 @@ def _lifespan(settings: Settings) -> Callable[[FastAPI], AbstractAsyncContextMan
         session_factory = create_session_factory(engine)
         app.state.db_session_factory = session_factory
         app.state.redis = redis
+        if not hasattr(app.state, "trip_planner"):
+            app.state.trip_planner = LangGraphTripPlanner(settings)
         cleanup_task: asyncio.Task[None] | None = None
         if settings.cleanup_enabled:
             cleanup_task = asyncio.create_task(

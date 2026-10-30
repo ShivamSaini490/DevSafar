@@ -9,7 +9,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.security import utc_now
 from app.models.conversation import Conversation
+from app.models.itinerary import Itinerary
 from app.models.message import Message
+from app.models.trip import Trip
 from app.services.cleanup_service import CleanupCounts, CleanupService
 
 
@@ -59,8 +61,12 @@ async def test_cleanup_is_batched_and_idempotent(
     service = CleanupService(db_session)
     first = await service.delete_expired_conversations(batch_size=1)
     second = await service.delete_expired_conversations(batch_size=1)
-    assert first == CleanupCounts(conversations=1, messages=2)
+    assert first == CleanupCounts(
+        conversations=1, messages=2, trips=1, itineraries=1
+    )
     assert second == CleanupCounts()
     assert await db_session.scalar(select(func.count(Conversation.id))) == 1
     assert await db_session.scalar(select(func.count(Message.id))) == 2
+    assert await db_session.scalar(select(func.count(Trip.id))) == 1
+    assert await db_session.scalar(select(func.count(Itinerary.id))) == 1
     assert await db_session.scalar(select(Conversation.title)) == "Valid"

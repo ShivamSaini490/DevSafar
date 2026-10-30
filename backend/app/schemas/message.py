@@ -5,6 +5,8 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from app.schemas.trip import TripResponse
+
 
 def _clean_content(value: str) -> str:
     cleaned = value.strip()
@@ -32,6 +34,7 @@ class MessageResponse(BaseModel):
 class MessageTurnResponse(BaseModel):
     user_message: MessageResponse
     assistant_message: MessageResponse
+    trip: TripResponse
 
 
 class TemporaryChatRequest(BaseModel):
@@ -56,3 +59,4 @@ class TemporaryChatResponse(BaseModel):
     temp_token: str | None
     context_message_count: int
     expires_in_seconds: int
+    trip: TripResponse

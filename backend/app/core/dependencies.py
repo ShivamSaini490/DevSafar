@@ -9,6 +9,7 @@ from redis.asyncio import Redis
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
+from app.agents.graph import TripPlanner
 from app.core.config import Settings
 from app.core.exceptions import AppError
 from app.core.logging import redact_exception_message
@@ -33,6 +34,10 @@ def get_redis_client(request: Request) -> Redis:
 
 def get_request_settings(request: Request) -> Settings:
     return cast(Settings, request.app.state.settings)
+
+
+def get_trip_planner(request: Request) -> TripPlanner:
+    return cast(TripPlanner, request.app.state.trip_planner)
 
 
 @dataclass(frozen=True, slots=True)

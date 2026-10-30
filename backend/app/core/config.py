@@ -46,6 +46,9 @@ class Settings(BaseSettings):
     redis_url: SecretStr = SecretStr("redis://127.0.0.1:6379/0")
 
     groq_api_key: SecretStr | None = None
+    groq_model: str = "llama-3.3-70b-versatile"
+    groq_timeout_seconds: float = Field(default=30.0, gt=0, le=60)
+    graph_timeout_seconds: float = Field(default=60.0, gt=0, le=180)
     qdrant_url: str | None = None
     qdrant_api_key: SecretStr | None = None
 
@@ -139,6 +142,13 @@ class Settings(BaseSettings):
     @property
     def uses_ephemeral_auth_secret(self) -> bool:
         return self._uses_ephemeral_auth_secret
+
+    @property
+    def groq_configured(self) -> bool:
+        return bool(
+            self.groq_api_key is not None
+            and self.groq_api_key.get_secret_value().strip()
+        )
 
     def redaction_secret_values(self) -> tuple[str, ...]:
         optional_secrets = (

@@ -1,4 +1,4 @@
-# DevSafar Backend - Foundation + Auth/OTP + Chat Modes
+# DevSafar Backend - Foundation + Auth/OTP + Chat Modes + LangGraph Slice
 
 Python 3.12 FastAPI foundation with async PostgreSQL, Redis, versioned health routes,
 safe error responses, structured redacted logs, Docker, and tests.
@@ -24,7 +24,21 @@ opaque `temp_token` response field. The frontend must keep that token and its ra
 `temp_session_id` only in tab memory and send both on later turns. A cookie is deliberately
 not used because cookies are shared across browser tabs; the Redis key is an HMAC of both
 values, and neither raw value is used as a key or logged. The endpoint returns the clearly
-labelled placeholder `AI planning not connected yet` until the LangGraph module is built.
+labelled structured trip response from the same in-request graph. Temporary results and
+follow-up context stay only in bounded Redis state and never create trip or itinerary rows.
+
+The LangGraph vertical slice runs five nodes in-request: intent, stub research,
+deterministic planning, deterministic validation, and response. Groq is used only for
+structured intent extraction; dates, durations, budgets, totals, retries, and feasibility
+are calculated in Python. Maps, transport, hotel, and places integrations are clearly
+labelled stubs and never emit `live_quote`. Configure `GROQ_MODEL`,
+`GROQ_TIMEOUT_SECONDS`, and `GRAPH_TIMEOUT_SECONDS` as needed. Missing or failed Groq
+configuration returns a public-safe `503` instead of an internal error.
+
+Saved chat turns persist the strict `TripResponse` and a versioned itinerary in PostgreSQL.
+`GET /api/v1/trips/{trip_id}` enforces the same owner and unexpired-conversation rules as
+chat retrieval. The graph currently has no checkpointer; saved-only checkpointing is
+deferred, and temporary chats must never create checkpoints.
 
 Expired-chat cleanup runs from the FastAPI lifespan every 15 minutes by default. It can be
 configured with `CLEANUP_INTERVAL_SECONDS` and `CLEANUP_BATCH_SIZE`, or disabled with
@@ -79,7 +93,9 @@ pytest
 
 ## Tracing and sensitive data
 
-LangSmith tracing defaults to off. It must remain off for every temporary-chat execution.
-Before any saved-chat trace is sent, passwords, OTPs, tokens, cookies, email addresses,
-API keys, and other sensitive fields must be redacted. Application logs use the same
-redaction rule and must never contain raw secrets.
+LangSmith tracing defaults to off and is enabled only when `LANGSMITH_TRACING=true`, a
+LangSmith key exists, and the run is a saved chat. Temporary execution explicitly disables
+tracing at graph invocation. Trace tags contain only `saved_chat`; metadata contains only
+the opaque conversation ID, while input/output masking hooks replace traced payloads.
+Application logs use the existing redaction rules and never include user prompts or raw
+secrets in planning-failure diagnostics.

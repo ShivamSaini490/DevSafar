@@ -9,12 +9,12 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import Settings
+from app.core.tracing import temporary_chat_tracing_enabled
 from app.models.conversation import Conversation
+from app.models.itinerary import Itinerary
 from app.models.message import Message
-from app.services.temporary_chat_service import (
-    TEMPORARY_CHAT_KEY_PREFIX,
-    temporary_chat_tracing_enabled,
-)
+from app.models.trip import Trip
+from app.services.temporary_chat_service import TEMPORARY_CHAT_KEY_PREFIX
 
 
 def _session_id() -> str:
@@ -35,11 +35,16 @@ async def test_guest_temporary_chat_uses_redis_only_and_expires(
     )
     assert first.status_code == 200, first.text
     body = first.json()
-    assert body["assistant_message"] == "AI planning not connected yet"
+    assert body["trip"]["status"] == "completed"
+    assert body["assistant_message"].startswith(
+        "A source-labelled draft trip plan is ready."
+    )
     assert body["temp_token"]
     assert body["context_message_count"] == 2
     assert await db_session.scalar(select(func.count(Conversation.id))) == 0
     assert await db_session.scalar(select(func.count(Message.id))) == 0
+    assert await db_session.scalar(select(func.count(Trip.id))) == 0
+    assert await db_session.scalar(select(func.count(Itinerary.id))) == 0
 
     await asyncio.sleep(1.1)
     expired = await client.post(
@@ -142,6 +147,8 @@ async def test_signed_in_temporary_chat_requires_csrf_and_stays_temporary(
     assert response.status_code == 200, response.text
     assert await db_session.scalar(select(func.count(Conversation.id))) == 0
     assert await db_session.scalar(select(func.count(Message.id))) == 0
+    assert await db_session.scalar(select(func.count(Trip.id))) == 0
+    assert await db_session.scalar(select(func.count(Itinerary.id))) == 0
 
 
 @pytest.mark.asyncio

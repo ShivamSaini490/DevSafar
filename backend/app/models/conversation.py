@@ -9,7 +9,9 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.db.base import Base
 
 if TYPE_CHECKING:
+    from app.models.itinerary import Itinerary
     from app.models.message import Message
+    from app.models.trip import Trip
     from app.models.user import User
 
 
@@ -38,4 +40,10 @@ class Conversation(Base):
         cascade="all, delete-orphan",
         passive_deletes=True,
         order_by="Message.created_at",
+    )
+    trips: Mapped[list["Trip"]] = relationship(
+        back_populates="conversation", cascade="all, delete-orphan", passive_deletes=True
+    )
+    itineraries: Mapped[list["Itinerary"]] = relationship(
+        back_populates="conversation", cascade="all, delete-orphan", passive_deletes=True
     )

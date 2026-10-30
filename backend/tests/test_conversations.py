@@ -9,7 +9,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.security import utc_now
 from app.models.conversation import Conversation
+from app.models.itinerary import Itinerary
 from app.models.message import Message
+from app.models.trip import Trip
 
 
 async def _signup_and_login(client: AsyncClient, payload: dict[str, str]) -> None:
@@ -57,7 +59,10 @@ async def test_saved_conversation_crud_and_message_pagination(
         headers=_csrf_headers(client),
     )
     assert turn.status_code == 201, turn.text
-    assert turn.json()["assistant_message"]["content"] == "AI planning not connected yet"
+    assert turn.json()["trip"]["status"] == "completed"
+    assert turn.json()["assistant_message"]["content"].startswith(
+        "A source-labelled draft trip plan is ready."
+    )
     first_page = await client.get(
         f"/api/v1/conversations/{conversation['id']}/messages", params={"limit": 1}
     )
@@ -202,3 +207,5 @@ async def test_account_deletion_cascades_conversations_and_messages(
     assert deleted.status_code == 200, deleted.text
     assert await db_session.scalar(select(func.count(Conversation.id))) == 0
     assert await db_session.scalar(select(func.count(Message.id))) == 0
+    assert await db_session.scalar(select(func.count(Trip.id))) == 0
+    assert await db_session.scalar(select(func.count(Itinerary.id))) == 0
