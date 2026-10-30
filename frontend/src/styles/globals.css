@@ -1,0 +1,121 @@
+@import 'tailwindcss';
+
+@theme {
+  --color-ink: #0c1c2c;
+  --color-ink-soft: #14293d;
+  --color-paper: #f3f6f9;
+  --color-mint: #e4f4f3;
+  --color-line: #dbe5ec;
+  --color-muted: #566a7c;
+  --color-teal: #087f8c;
+  --color-teal-deep: #06656f;
+  --color-teal-bright: #2cc7bd;
+  --color-amber: #f3ac55;
+  --color-ticket: #fffaf0;
+
+  /* Chart colours. Checked with the dataviz palette validator on white. */
+  --color-chart-1: #00908a;
+  --color-chart-2: #c9781a;
+  --color-chart-3: #4f6bd8;
+  --color-chart-4: #b84f9a;
+  --color-chart-5: #6a8f2f;
+
+  --font-display: 'Bricolage Grotesque Variable', 'Segoe UI', sans-serif;
+  --font-sans: 'Instrument Sans Variable', 'Segoe UI', sans-serif;
+  --font-mono: 'JetBrains Mono', ui-monospace, Consolas, monospace;
+}
+
+html {
+  background: var(--color-ink);
+  -webkit-text-size-adjust: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--color-paper);
+  color: var(--color-ink-soft);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+  overflow-x: clip;
+}
+
+/* Layered, so Tailwind's outline-none can still turn this off on composed inputs */
+@layer base {
+  :focus-visible {
+    outline: 2px solid var(--color-teal-bright);
+    outline-offset: 3px;
+  }
+}
+
+::selection {
+  background: var(--color-amber);
+  color: var(--color-ink);
+}
+
+.eyebrow {
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  font-weight: 500;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+}
+
+.section-title {
+  font-family: var(--font-display);
+  font-weight: 700;
+  font-size: clamp(2.25rem, 5.2vw, 4.5rem);
+  line-height: 1.02;
+  letter-spacing: -0.03em;
+  text-wrap: balance;
+}
+
+/* Boarding pass tear line */
+.ticket-notch {
+  --notch: 11px;
+  mask:
+    radial-gradient(circle var(--notch) at var(--tear, 68%) 0, transparent 98%, #000) top / 100% 51% no-repeat,
+    radial-gradient(circle var(--notch) at var(--tear, 68%) 100%, transparent 98%, #000) bottom / 100% 51% no-repeat;
+}
+
+/* Route cities on the hero map switch on as the line reaches them */
+.city {
+  opacity: 0.6;
+  transition: opacity 0.4s ease;
+}
+.city.is-on {
+  opacity: 1;
+}
+.city .city-ring {
+  transform-box: fill-box;
+  transform-origin: center;
+  transform: scale(0.4);
+  opacity: 0;
+  transition:
+    transform 0.6s cubic-bezier(0.2, 0.8, 0.2, 1),
+    opacity 0.4s ease;
+}
+.city.is-on .city-ring {
+  transform: scale(1);
+  opacity: 1;
+}
+
+.barcode {
+  background: repeating-linear-gradient(
+    90deg,
+    currentColor 0 2px,
+    transparent 2px 4px,
+    currentColor 4px 5px,
+    transparent 5px 9px,
+    currentColor 9px 12px,
+    transparent 12px 14px
+  );
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    transition-duration: 0.01ms !important;
+    animation-duration: 0.01ms !important;
+  }
+}
