@@ -9,6 +9,11 @@ from app.schemas.common import PriceQuote, StrictSchema
 TransportMode = Literal["flight", "train", "bus", "road", "unknown"]
 
 
+class DrivingSegment(StrictSchema):
+    starts_at: datetime
+    ends_at: datetime
+
+
 class RouteLeg(StrictSchema):
     origin: str
     destination: str
@@ -18,6 +23,8 @@ class RouteLeg(StrictSchema):
     distance_km: Decimal | None = Field(default=None, ge=0)
     departure_at: datetime | None = None
     arrival_at: datetime | None = None
+    overnight_stops: int = Field(default=0, ge=0)
+    driving_segments: list[DrivingSegment] = Field(default_factory=list)
     price: PriceQuote
 
 
@@ -27,5 +34,6 @@ class TransportOption(StrictSchema):
     mode: TransportMode
     provider: str
     duration_minutes: int | None = Field(default=None, ge=0)
+    distance_km: Decimal | None = Field(default=None, ge=0)
     price: PriceQuote
     availability: Literal["available", "unavailable", "unknown"] = "unknown"

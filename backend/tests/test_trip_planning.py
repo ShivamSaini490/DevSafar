@@ -1,5 +1,5 @@
 import logging
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 from uuid import UUID
@@ -19,6 +19,7 @@ from app.core.security import utc_now
 from app.models.conversation import Conversation
 from app.models.itinerary import Itinerary
 from app.models.trip import Trip
+from app.utils.datetime_utils import INDIA_TIME_ZONE
 
 
 class FakeIntentCompletionClient:
@@ -73,6 +74,7 @@ def _install_groq_intent_model(
             client=fake_client,
             today_provider=lambda: effective_date,
         ),
+        now_provider=lambda: datetime(2026, 10, 30, 5, 0, tzinfo=INDIA_TIME_ZONE),
     )
 
 

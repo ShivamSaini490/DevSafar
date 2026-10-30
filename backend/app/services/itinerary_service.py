@@ -17,8 +17,35 @@ class ItineraryService:
             return []
 
         activities_by_date: dict[date, list[ItineraryActivity]] = defaultdict(list)
-        destination_by_date: dict[date, str] = {}
+        end_location_events: dict[date, list[tuple[datetime, str]]] = defaultdict(list)
         for index, leg in enumerate(route_legs):
+            for segment_index, segment in enumerate(leg.driving_segments):
+                arrives_at_destination = (
+                    leg.arrival_at is not None and segment.ends_at == leg.arrival_at
+                )
+                activities_by_date[segment.starts_at.date()].append(
+                    ItineraryActivity(
+                        title=(
+                            f"Drive from {leg.origin} toward {leg.destination}"
+                            if segment_index == 0
+                            else f"Continue driving toward {leg.destination}"
+                        ),
+                        location=f"{leg.origin} to {leg.destination}",
+                        starts_at=segment.starts_at,
+                        ends_at=segment.ends_at,
+                        notes=(
+                            f"Road duration source: {leg.duration_source or 'unverified'}; "
+                            "scheduled within the configured driving-day limit."
+                        ),
+                    )
+                )
+                end_location_events[segment.ends_at.date()].append(
+                    (
+                        segment.ends_at,
+                        leg.destination if arrives_at_destination else "en route",
+                    )
+                )
+
             if leg.arrival_at is None:
                 continue
             arrival_at = leg.arrival_at
@@ -40,12 +67,27 @@ class ItineraryService:
                         f"Arrival after {leg.duration_minutes} minutes of "
                         f"{leg.mode} travel; duration source: "
                         f"{leg.duration_source or 'unverified'}."
+                        + (
+                            f" Includes {leg.overnight_stops} overnight driving rest stop(s)."
+                            if leg.overnight_stops
+                            else ""
+                        )
                     ),
                 )
             )
-            destination_by_date[arrival_at.date()] = leg.destination
 
             if leg.destination == requirements.origin:
+                continue
+            if next_departure is not None and next_departure.date() == arrival_at.date():
+                activities_by_date[arrival_at.date()].append(
+                    ItineraryActivity(
+                        title=f"Pass through {leg.destination}, no stay planned",
+                        location=leg.destination,
+                        starts_at=arrival_end,
+                        ends_at=max(arrival_end, next_departure),
+                        notes="No overnight stay fits before the next road leg.",
+                    )
+                )
                 continue
             activity_start = max(
                 arrival_at + timedelta(hours=1),
@@ -57,14 +99,13 @@ class ItineraryService:
             if activity_end > activity_start:
                 activities_by_date[activity_start.date()].append(
                     ItineraryActivity(
-                        title="Stub itinerary activity",
+                        title=f"Flexible visit time in {leg.destination}",
                         location=leg.destination,
                         starts_at=activity_start,
                         ends_at=activity_end,
-                        notes="Placeholder schedule; providers are not connected.",
+                        notes="Draft activity after arrival; local details are not connected.",
                     )
                 )
-                destination_by_date[activity_start.date()] = leg.destination
 
         last_arrival_date = max(
             (leg.arrival_at.date() for leg in route_legs if leg.arrival_at is not None),
@@ -76,30 +117,39 @@ class ItineraryService:
         day_date = requirements.start_date
         day_number = 1
         while day_date <= final_date:
-            arrivals_today = [
-                leg
-                for leg in route_legs
-                if leg.arrival_at is not None and leg.arrival_at.date() == day_date
-            ]
-            if arrivals_today:
-                current_destination = arrivals_today[-1].destination
-            current_destination = destination_by_date.get(day_date, current_destination)
+            events_today = sorted(
+                end_location_events.get(day_date, []),
+                key=lambda event: event[0],
+            )
+            if events_today:
+                current_destination = events_today[-1][1]
+            activities = sorted(
+                activities_by_date.get(day_date, []),
+                key=lambda activity: (
+                    activity.starts_at
+                    or datetime.combine(
+                        day_date,
+                        time.min,
+                        tzinfo=INDIA_TIME_ZONE,
+                    )
+                ),
+            )
+            if not activities:
+                activities = [
+                    ItineraryActivity(
+                        title=f"Flexible/rest day in {current_destination}",
+                        location=current_destination,
+                        starts_at=at_india_time(day_date, hour=10),
+                        ends_at=at_india_time(day_date, hour=18),
+                        notes="No provider-backed activity is scheduled for this day.",
+                    )
+                ]
             days.append(
                 ItineraryDay(
                     day=day_number,
                     date=day_date,
                     destination=current_destination,
-                    activities=sorted(
-                        activities_by_date.get(day_date, []),
-                        key=lambda activity: (
-                            activity.starts_at
-                            or datetime.combine(
-                                day_date,
-                                time.min,
-                                tzinfo=INDIA_TIME_ZONE,
-                            )
-                        ),
-                    ),
+                    activities=activities,
                 )
             )
             day_date += timedelta(days=1)

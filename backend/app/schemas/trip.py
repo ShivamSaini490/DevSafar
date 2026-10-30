@@ -54,7 +54,12 @@ class TripRequirements(StrictSchema):
 
 class TripResponse(StrictSchema):
     trip_id: UUID
-    status: TripStatus
+    status: TripStatus = Field(
+        description=(
+            "completed includes feasible and infeasible plans; failed is reserved for "
+            "execution errors"
+        )
+    )
     requirements: TripRequirements
     feasible: bool | None
     warnings: list[str] = Field(default_factory=list)

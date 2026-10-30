@@ -11,6 +11,13 @@ from app.agents.graph import LangGraphTripPlanner
 from app.core.config import Settings
 from app.core.tracing import trace_policy
 from app.schemas.trip import TripRequirements, TripResponse
+from app.utils.datetime_utils import INDIA_TIME_ZONE
+
+FIXED_NOW = datetime(2026, 10, 30, 5, 0, tzinfo=INDIA_TIME_ZONE)
+
+
+def fixed_now() -> datetime:
+    return FIXED_NOW
 
 
 class StaticIntentModel:
@@ -28,7 +35,11 @@ class StaticIntentModel:
 async def test_example_prompt_maps_to_canonical_typed_response(
     settings: Settings, fake_intent_model: FakeIntentModel
 ) -> None:
-    planner = LangGraphTripPlanner(settings, intent_model=fake_intent_model)
+    planner = LangGraphTripPlanner(
+        settings,
+        intent_model=fake_intent_model,
+        now_provider=fixed_now,
+    )
     response = await planner.run(
         conversation_id=None,
         user_prompt=(
@@ -85,6 +96,7 @@ async def test_missing_critical_info_ends_before_research(settings: Settings) ->
         settings,
         intent_model=model,
         provider_factory=research_must_not_run,
+        now_provider=fixed_now,
     )
     response = await planner.run(
         conversation_id=None,
@@ -121,7 +133,11 @@ async def test_ambiguities_alone_do_not_block_planning(settings: Settings) -> No
             ],
         )
     )
-    response = await LangGraphTripPlanner(settings, intent_model=model).run(
+    response = await LangGraphTripPlanner(
+        settings,
+        intent_model=model,
+        now_provider=fixed_now,
+    ).run(
         conversation_id=None,
         user_prompt="complete prompt with non-critical assumptions",
         previous_trip=None,
@@ -150,7 +166,11 @@ async def test_missing_budget_and_deadline_warn_but_continue(settings: Settings)
             return_deadline=None,
         )
     )
-    response = await LangGraphTripPlanner(settings, intent_model=model).run(
+    response = await LangGraphTripPlanner(
+        settings,
+        intent_model=model,
+        now_provider=fixed_now,
+    ).run(
         conversation_id=None,
         user_prompt="plan without optional constraints",
         previous_trip=None,
@@ -179,7 +199,11 @@ async def test_missing_budget_and_deadline_warn_but_continue(settings: Settings)
 async def test_deterministic_validation_marks_impossible_plans_infeasible(
     settings: Settings, prompt: str, reason: str
 ) -> None:
-    planner = LangGraphTripPlanner(settings, intent_model=FakeIntentModel())
+    planner = LangGraphTripPlanner(
+        settings,
+        intent_model=FakeIntentModel(),
+        now_provider=fixed_now,
+    )
     response = await planner.run(
         conversation_id=None,
         user_prompt=prompt,
@@ -187,9 +211,15 @@ async def test_deterministic_validation_marks_impossible_plans_infeasible(
         chat_mode="temporary",
     )
     assert response.feasible is False
-    assert response.status == "failed"
+    assert response.status == "completed"
     assert any(reason in warning for warning in response.warnings)
-    assert any("Safer alternative" in warning for warning in response.warnings)
+    assert response.warnings[-4:] == [
+        "Alternative 1: Compare train/bus/flight options (not integrated yet; links to official "
+        "search pages are coming).",
+        "Alternative 2: Extend the trip dates or return deadline.",
+        "Alternative 3: Drop a destination.",
+        "Alternative 4: Increase the budget.",
+    ]
 
 
 def test_retry_edge_is_bounded_to_two() -> None:
@@ -205,7 +235,11 @@ def test_retry_edge_is_bounded_to_two() -> None:
 async def test_stub_provenance_and_prompt_injection_cannot_change_contract(
     settings: Settings,
 ) -> None:
-    planner = LangGraphTripPlanner(settings, intent_model=FakeIntentModel())
+    planner = LangGraphTripPlanner(
+        settings,
+        intent_model=FakeIntentModel(),
+        now_provider=fixed_now,
+    )
     response = await planner.run(
         conversation_id=None,
         user_prompt=(

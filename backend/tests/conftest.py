@@ -156,7 +156,9 @@ def app(settings: Settings, fake_intent_model: FakeIntentModel) -> FastAPI:
 
     application = create_app(settings)
     application.state.trip_planner = LangGraphTripPlanner(
-        settings, intent_model=fake_intent_model
+        settings,
+        intent_model=fake_intent_model,
+        now_provider=lambda: datetime(2026, 10, 30, 5, 0, tzinfo=INDIA_TIME_ZONE),
     )
     return application
 

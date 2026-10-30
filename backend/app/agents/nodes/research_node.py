@@ -5,7 +5,7 @@ from datetime import datetime
 from typing import Any
 
 from app.agents.state import TravelState
-from app.integrations.base import ProviderBundle, stub_sources
+from app.integrations.base import ProviderBundle, provider_sources
 
 
 def build_research_node(
@@ -31,7 +31,7 @@ def build_research_node(
             "destination_knowledge": [
                 "Stub destination knowledge only; RAG is not connected."
             ],
-            "provider_sources": stub_sources(fetched_at),
+            "provider_sources": provider_sources(providers, fetched_at),
         }
 
     return research_node
