@@ -81,6 +81,12 @@ class StubTransportProvider:
         ]
 
 
+class NoTransportProvider:
+    async def options(self, requirements: TripRequirements) -> list[TransportOption]:
+        del requirements
+        return []
+
+
 class StubHotelProvider:
     def __init__(self, fetched_at: datetime) -> None:
         self.fetched_at = fetched_at
@@ -166,7 +172,7 @@ class ProviderBundle:
     def with_maps(self, maps: MapsProvider, *, source_name: str) -> "ProviderBundle":
         return ProviderBundle(
             maps=maps,
-            transport=self.transport,
+            transport=(NoTransportProvider() if source_name == "osrm" else self.transport),
             hotels=self.hotels,
             places=self.places,
             maps_source_name=source_name,
@@ -175,9 +181,14 @@ class ProviderBundle:
 
 def provider_sources(bundle: ProviderBundle, fetched_at: datetime) -> list[DataSource]:
     maps_price_type: PriceType = "estimate" if bundle.maps_source_name == "osrm" else "unknown"
+    transport_source: tuple[str, PriceType] = (
+        ("osrm+fuel_formula", "estimate")
+        if bundle.maps_source_name == "osrm"
+        else ("stub_transport", "estimate")
+    )
     sources: tuple[tuple[str, PriceType], ...] = (
         (bundle.maps_source_name, maps_price_type),
-        ("stub_transport", "estimate"),
+        transport_source,
         ("stub_hotels", "estimate"),
         ("stub_places", "unknown"),
     )

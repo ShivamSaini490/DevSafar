@@ -24,7 +24,20 @@ _DATETIME_WITHOUT_YEAR_FORMATS = tuple(
 
 
 def india_today() -> date:
-    return datetime.now(INDIA_TIME_ZONE).date()
+    return india_now().date()
+
+
+def india_now() -> datetime:
+    return datetime.now(INDIA_TIME_ZONE)
+
+
+def next_sensible_slot(value: datetime, *, minutes: int = 30) -> datetime:
+    """Return the next strict clock slot in Asia/Kolkata."""
+
+    localized = as_india_time(value).replace(second=0, microsecond=0)
+    remainder = localized.minute % minutes
+    advance = minutes - remainder if remainder else minutes
+    return localized + timedelta(minutes=advance)
 
 
 def _clean_human_datetime(value: str) -> str:

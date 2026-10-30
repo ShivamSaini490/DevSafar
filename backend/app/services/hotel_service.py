@@ -1,3 +1,5 @@
+from datetime import timedelta
+
 from app.schemas.hotel import HotelOption
 from app.schemas.transport import RouteLeg
 from app.schemas.trip import TripRequirements
@@ -14,6 +16,39 @@ class HotelService:
             return []
         aligned: list[HotelOption] = []
         used_option_ids: set[int] = set()
+        rest_template = hotel_options[0] if hotel_options else None
+        if rest_template is not None:
+            for leg in route_legs:
+                for current_segment, next_segment in zip(
+                    leg.driving_segments,
+                    leg.driving_segments[1:],
+                    strict=False,
+                ):
+                    check_in = current_segment.ends_at.date()
+                    check_out = next_segment.starts_at.date()
+                    if check_out <= check_in:
+                        continue
+                    nightly = rest_template.nightly_price.model_copy(
+                        update={"source": "stub_overnight_rest_estimate"}
+                    )
+                    night = check_in
+                    while night < check_out:
+                        next_day = night + timedelta(days=1)
+                        aligned.append(
+                            HotelOption(
+                                destination="en route",
+                                name=(
+                                    "Overnight rest stop between "
+                                    f"{leg.origin} and {leg.destination}"
+                                ),
+                                check_in=night,
+                                check_out=next_day,
+                                nightly_price=nightly,
+                                total_price=nightly.model_copy(deep=True),
+                                availability="unknown",
+                            )
+                        )
+                        night = next_day
         for index, arrival_leg in enumerate(route_legs):
             if arrival_leg.destination == requirements.origin or arrival_leg.arrival_at is None:
                 continue
@@ -64,4 +99,7 @@ class HotelService:
                     }
                 )
             )
-        return aligned
+        return sorted(
+            aligned,
+            key=lambda option: (option.check_in, option.check_out, option.name),
+        )

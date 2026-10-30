@@ -2,9 +2,14 @@ from datetime import date, datetime, timedelta
 
 from app.core.security import utc_now
 from app.schemas.common import PriceQuote
-from app.schemas.transport import RouteLeg
+from app.schemas.transport import DrivingSegment, RouteLeg
 from app.schemas.trip import TripRequirements
-from app.utils.datetime_utils import at_india_time
+from app.utils.datetime_utils import (
+    as_india_time,
+    at_india_time,
+    india_now,
+    next_sensible_slot,
+)
 
 DEFAULT_STUB_DURATION_MINUTES = 480
 DEFAULT_DEPARTURE_HOUR = 6
@@ -30,6 +35,7 @@ class RouteService:
         *,
         use_stub_defaults: bool = True,
         max_driving_hours_per_day: int = 10,
+        now: datetime | None = None,
     ) -> list[RouteLeg]:
         if requirements.start_date is None:
             return []
@@ -82,6 +88,7 @@ class RouteService:
         schedule_known = True
         driven_minutes_by_date: dict[date, int] = {}
         daily_limit_minutes = max_driving_hours_per_day * 60
+        current_time = as_india_time(now or india_now())
         scheduled: list[RouteLeg] = []
         for index, leg in enumerate(selected):
             day_offset = 0 if leg_count == 1 else (index * (day_count - 1)) // (leg_count - 1)
@@ -89,6 +96,11 @@ class RouteService:
                 requirements.start_date + timedelta(days=day_offset),
                 hour=DEFAULT_DEPARTURE_HOUR,
             )
+            if index == 0 and requirements.start_date == current_time.date():
+                planned_departure = max(
+                    planned_departure,
+                    next_sensible_slot(current_time),
+                )
             departure_at: datetime | None = (
                 max(planned_departure, previous_arrival)
                 if previous_arrival is not None
@@ -96,6 +108,12 @@ class RouteService:
             )
             if not schedule_known:
                 departure_at = None
+            elif departure_at is not None:
+                departure_at = RouteService._normalize_driving_start(
+                    departure_at,
+                    daily_limit_minutes=daily_limit_minutes,
+                    driven_minutes_by_date=driven_minutes_by_date,
+                )
             duration_minutes = leg.duration_minutes
             duration_source = leg.duration_source
             if duration_minutes is None and use_stub_defaults:
@@ -104,14 +122,17 @@ class RouteService:
             if duration_minutes is None or departure_at is None:
                 arrival_at = None
                 overnight_stops = 0
+                driving_segments: list[DrivingSegment] = []
                 schedule_known = False
             else:
-                arrival_at, overnight_stops = RouteService._add_driving_time(
+                arrival_at, overnight_stops, driving_segments = RouteService._add_driving_time(
                     departure_at,
                     duration_minutes,
                     daily_limit_minutes=daily_limit_minutes,
                     driven_minutes_by_date=driven_minutes_by_date,
                 )
+                if driving_segments:
+                    departure_at = driving_segments[0].starts_at
             scheduled.append(
                 leg.model_copy(
                     update={
@@ -120,6 +141,7 @@ class RouteService:
                         "departure_at": departure_at,
                         "arrival_at": arrival_at,
                         "overnight_stops": overnight_stops,
+                        "driving_segments": driving_segments,
                     }
                 )
             )
@@ -134,30 +156,66 @@ class RouteService:
         *,
         daily_limit_minutes: int,
         driven_minutes_by_date: dict[date, int],
-    ) -> tuple[datetime, int]:
+    ) -> tuple[datetime, int, list[DrivingSegment]]:
         current = departure_at
         remaining = duration_minutes
         overnight_stops = 0
+        segments: list[DrivingSegment] = []
         while remaining > 0:
             driving_date = current.date()
             used_today = driven_minutes_by_date.get(driving_date, 0)
-            available_today = daily_limit_minutes - used_today
+            driving_day_end = at_india_time(driving_date, hour=6) + timedelta(
+                minutes=daily_limit_minutes
+            )
+            clock_minutes_left = max(
+                0,
+                int((driving_day_end - current).total_seconds() // 60),
+            )
+            available_today = min(
+                daily_limit_minutes - used_today,
+                clock_minutes_left,
+            )
             if available_today <= 0:
                 current = at_india_time(current.date() + timedelta(days=1), hour=6)
                 overnight_stops += 1
                 continue
             driving_now = min(remaining, available_today)
-            current += timedelta(minutes=driving_now)
+            segment_start = current
+            current = segment_start + timedelta(minutes=driving_now)
+            segments.append(DrivingSegment(starts_at=segment_start, ends_at=current))
             driven_minutes_by_date[driving_date] = used_today + driving_now
             remaining -= driving_now
             if remaining > 0:
                 current = at_india_time(current.date() + timedelta(days=1), hour=6)
                 overnight_stops += 1
-        return current, overnight_stops
+        return current, overnight_stops, segments
 
     @staticmethod
-    def schedule_warnings(route_legs: list[RouteLeg], *, daily_hours: int) -> list[str]:
-        return [
+    def _normalize_driving_start(
+        candidate: datetime,
+        *,
+        daily_limit_minutes: int,
+        driven_minutes_by_date: dict[date, int],
+    ) -> datetime:
+        current = candidate
+        while True:
+            day_start = at_india_time(current.date(), hour=6)
+            day_end = day_start + timedelta(minutes=daily_limit_minutes)
+            if current < day_start:
+                current = day_start
+            used_today = driven_minutes_by_date.get(current.date(), 0)
+            if current < day_end and used_today < daily_limit_minutes:
+                return current
+            current = at_india_time(current.date() + timedelta(days=1), hour=6)
+
+    @staticmethod
+    def schedule_warnings(
+        route_legs: list[RouteLeg],
+        *,
+        daily_hours: int,
+        start_date: date | None = None,
+    ) -> list[str]:
+        warnings = [
             (
                 f"Road leg {leg.origin} to {leg.destination} needs "
                 f"{leg.overnight_stops} overnight rest stop(s) under the "
@@ -166,3 +224,19 @@ class RouteService:
             for leg in route_legs
             if leg.overnight_stops > 0
         ]
+        if route_legs and route_legs[0].departure_at is not None and start_date is not None:
+            first_leg = route_legs[0]
+            first_departure = first_leg.departure_at
+            if first_departure is None:
+                return warnings
+            default_departure = at_india_time(start_date, hour=6)
+            if first_departure > default_departure:
+                warnings.insert(
+                    0,
+                    (
+                        "First departure shifted to "
+                        f"{first_departure.isoformat()} because the earlier 06:00 "
+                        "slot has passed."
+                    ),
+                )
+        return warnings

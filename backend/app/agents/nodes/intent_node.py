@@ -1,3 +1,5 @@
+from collections.abc import Callable
+from datetime import datetime
 from typing import Any
 from uuid import uuid4
 
@@ -5,9 +7,14 @@ from app.agents.llm import IntentModel
 from app.agents.state import TravelState
 from app.schemas.budget import empty_budget
 from app.schemas.trip import TripRequirements, TripResponse
+from app.utils.datetime_utils import india_now
 
 
-def _critical_questions(requirements: TripRequirements) -> list[str]:
+def _critical_questions(
+    requirements: TripRequirements,
+    *,
+    now: datetime,
+) -> list[str]:
     questions: list[str] = []
     if not requirements.origin:
         questions.append("Which city are you starting from?")
@@ -17,6 +24,13 @@ def _critical_questions(requirements: TripRequirements) -> list[str]:
         questions.append("What is your trip start date?")
     if requirements.end_date is None:
         questions.append("What is your trip end date?")
+    if requirements.start_date is not None and requirements.start_date < now.date():
+        questions.extend(
+            [
+                "Start date is in the past",
+                "What future start date should I use?",
+            ]
+        )
     if (
         requirements.start_date is not None
         and requirements.end_date is not None
@@ -51,13 +65,17 @@ def _planning_warnings(requirements: TripRequirements) -> list[str]:
     return list(dict.fromkeys(warnings))
 
 
-def build_intent_node(intent_model: IntentModel) -> Any:
+def build_intent_node(
+    intent_model: IntentModel,
+    *,
+    now_provider: Callable[[], datetime] = india_now,
+) -> Any:
     async def intent_node(state: TravelState) -> dict[str, Any]:
         requirements = await intent_model.extract_requirements(
             user_prompt=state["user_prompt"],
             previous_trip=state["previous_trip"],
         )
-        questions = _critical_questions(requirements)
+        questions = _critical_questions(requirements, now=now_provider())
         if questions:
             response = TripResponse(
                 trip_id=uuid4(),

@@ -1,5 +1,6 @@
 from datetime import date, datetime
 from decimal import Decimal
+from typing import NoReturn
 
 import httpx
 import pytest
@@ -245,6 +246,7 @@ async def _run_road_plan(
     distance_km: Decimal,
     duration_minutes: int,
     deadline: datetime,
+    now: datetime | None = None,
 ) -> TripResponse:
     osm_settings = settings.model_copy(update={"maps_provider": "osm"})
     requirements = TripRequirements(
@@ -270,6 +272,8 @@ async def _run_road_plan(
         osm_settings,
         intent_model=StaticIntentModel(requirements),
         provider_factory=provider_factory,
+        now_provider=lambda: now
+        or datetime(2026, 10, 30, 5, 0, tzinfo=INDIA_TIME_ZONE),
     )
     return await planner.run(
         conversation_id=None,
@@ -290,17 +294,68 @@ async def test_long_road_route_uses_multi_day_schedule_and_misses_deadline(
         deadline=datetime(2026, 10, 31, 10, tzinfo=INDIA_TIME_ZONE),
     )
     assert response.feasible is False
-    assert response.status == "failed"
+    assert response.status == "completed"
     assert len(response.route_legs) == 2
     assert sum(leg.overnight_stops for leg in response.route_legs) >= 2
     assert response.route_legs[-1].arrival_at is not None
     assert response.route_legs[-1].arrival_at > response.requirements.return_deadline
     assert any("misses the required return deadline" in warning for warning in response.warnings)
     assert any("overnight rest stop" in warning for warning in response.warnings)
-    assert any("Safer alternative" in warning for warning in response.warnings)
+    assert response.warnings[-4:] == [
+        "Alternative 1: Compare train/bus/flight options (not integrated yet; links to official "
+        "search pages are coming).",
+        "Alternative 2: Extend the trip dates or return deadline.",
+        "Alternative 3: Drop a destination.",
+        "Alternative 4: Increase the budget.",
+    ]
     assert (
         "Based on road travel estimates only; trains, buses and flights are not compared yet."
         in response.warnings
+    )
+    assert (
+        "Road cost assumes a private car at INR 12.00 per km; adjust FUEL_COST_PER_KM."
+        in response.warnings
+    )
+    assert (
+        "OSRM durations exclude traffic, so real travel time may be longer."
+        in response.warnings
+    )
+    assert len(response.transport_options) == len(response.route_legs)
+    for option, leg in zip(response.transport_options, response.route_legs, strict=True):
+        assert option.origin == leg.origin
+        assert option.destination == leg.destination
+        assert option.provider == "osrm+fuel_formula"
+        assert option.distance_km == leg.distance_km
+        assert option.duration_minutes == leg.duration_minutes
+        assert option.price == leg.price
+        assert option.price.price_type == "estimate"
+
+    rest_stays = [
+        hotel
+        for hotel in response.hotels
+        if hotel.name.startswith("Overnight rest stop between")
+    ]
+    assert rest_stays
+    assert all(hotel.destination == "en route" for hotel in rest_stays)
+    assert all(hotel.destination != response.requirements.origin for hotel in response.hotels)
+    assert all(hotel.check_out > hotel.check_in for hotel in response.hotels)
+    assert all(hotel.total_price.price_type == "estimate" for hotel in rest_stays)
+    assert all(hotel.total_price.source == "stub_overnight_rest_estimate" for hotel in rest_stays)
+
+    assert all(day.activities for day in response.itinerary_days)
+    assert response.itinerary_days[0].destination == "en route"
+    assert response.itinerary_days[-1].destination == "Hyderabad"
+    assert all(
+        any(
+            activity.title.startswith(("Drive from", "Continue driving"))
+            for activity in day.activities
+        )
+        for day in response.itinerary_days
+    )
+    assert any(
+        activity.title == "Pass through Puducherry, no stay planned"
+        for day in response.itinerary_days
+        for activity in day.activities
     )
 
 
@@ -319,6 +374,55 @@ async def test_short_verified_road_route_is_feasible(settings: Settings) -> None
     )
     assert response.budget.known_subtotal >= Decimal("2400.00")
     assert response.data_sources[0].name == "osrm"
+    assert all(option.provider == "osrm+fuel_formula" for option in response.transport_options)
+
+
+@pytest.mark.asyncio
+async def test_same_day_start_uses_next_sensible_slot_and_warns(settings: Settings) -> None:
+    response = await _run_road_plan(
+        settings,
+        distance_km=Decimal("50"),
+        duration_minutes=60,
+        deadline=datetime(2026, 10, 31, 12, tzinfo=INDIA_TIME_ZONE),
+        now=datetime(2026, 10, 30, 14, 10, tzinfo=INDIA_TIME_ZONE),
+    )
+    assert response.route_legs[0].departure_at == datetime(
+        2026, 10, 30, 14, 30, tzinfo=INDIA_TIME_ZONE
+    )
+    assert any("First departure shifted" in warning for warning in response.warnings)
+
+
+@pytest.mark.asyncio
+async def test_past_start_date_asks_for_clarification_without_research(
+    settings: Settings,
+) -> None:
+    requirements = TripRequirements(
+        origin="Hyderabad",
+        destinations=["Puducherry"],
+        start_date=date(2026, 10, 29),
+        end_date=date(2026, 10, 30),
+    )
+
+    def research_must_not_run(_fetched_at: datetime) -> NoReturn:
+        raise AssertionError("research ran for a past-date clarification")
+
+    response = await LangGraphTripPlanner(
+        settings,
+        intent_model=StaticIntentModel(requirements),
+        provider_factory=research_must_not_run,
+        now_provider=lambda: datetime(2026, 10, 30, 12, 0, tzinfo=INDIA_TIME_ZONE),
+    ).run(
+        conversation_id=None,
+        user_prompt="past date",
+        previous_trip=None,
+        chat_mode="saved",
+    )
+    assert response.status == "needs_clarification"
+    assert response.warnings == [
+        "Start date is in the past",
+        "What future start date should I use?",
+    ]
+    assert response.route_legs == []
 
 
 @pytest.mark.asyncio
@@ -333,6 +437,7 @@ async def test_stub_mode_remains_unverified(settings: Settings) -> None:
     response = await LangGraphTripPlanner(
         settings,
         intent_model=StaticIntentModel(requirements),
+        now_provider=lambda: datetime(2026, 10, 30, 5, 0, tzinfo=INDIA_TIME_ZONE),
     ).run(
         conversation_id=None,
         user_prompt="stub mode",

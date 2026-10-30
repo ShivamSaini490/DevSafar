@@ -19,6 +19,7 @@ from app.core.security import utc_now
 from app.core.tracing import ChatMode, graph_tracing_context
 from app.integrations.base import ProviderBundle
 from app.schemas.trip import TripResponse
+from app.utils.datetime_utils import india_now
 
 
 class TripPlanningFailure(Exception):
@@ -43,12 +44,22 @@ class LangGraphTripPlanner:
         *,
         intent_model: IntentModel | None = None,
         provider_factory: Callable[[datetime], ProviderBundle] = ProviderBundle.stubs,
+        now_provider: Callable[[], datetime] = india_now,
     ) -> None:
         self.settings = settings
         workflow = StateGraph(TravelState)
-        workflow.add_node("intent", build_intent_node(intent_model or GroqIntentModel(settings)))
+        workflow.add_node(
+            "intent",
+            build_intent_node(
+                intent_model or GroqIntentModel(settings),
+                now_provider=now_provider,
+            ),
+        )
         workflow.add_node("research", build_research_node(provider_factory))
-        workflow.add_node("planning", build_planning_node(settings))
+        workflow.add_node(
+            "planning",
+            build_planning_node(settings, now_provider=now_provider),
+        )
         workflow.add_node("validation", validation_node)
         workflow.add_node("response", response_node)
         workflow.add_edge(START, "intent")
