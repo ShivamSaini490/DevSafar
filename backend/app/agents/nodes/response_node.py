@@ -61,6 +61,7 @@ def build_response_node(settings: Settings) -> Any:
             booking_links=booking_service.build(
                 requirements,
                 state["route_options"],
+                state["hotels"],
             ),
         )
         return {

@@ -73,6 +73,11 @@ class Settings(BaseSettings):
     tavily_max_searches_per_trip: int = Field(default=2, ge=0, le=10)
     tavily_cache_ttl_seconds: int = Field(default=604_800, ge=60)
     tavily_timeout_seconds: float = Field(default=10.0, gt=0, le=60)
+    tavily_excluded_domains: str = (
+        "youtube.com,youtu.be,facebook.com,instagram.com,tiktok.com,"
+        "x.com,pinterest.com"
+    )
+    attractions_per_destination: int = Field(default=6, ge=1, le=12)
     booking_allowed_hosts: str = (
         "www.irctc.co.in,www.makemytrip.com,www.redbus.in,"
         "www.google.com,www.booking.com"
@@ -166,6 +171,7 @@ class Settings(BaseSettings):
             allowed_hosts=allowed_hosts,
         )
         tavily_allowed_hosts = parse_host_allowlist(self.tavily_allowed_hosts)
+        parse_host_allowlist(self.tavily_excluded_domains)
         self.tavily_base_url = validate_external_base_url(
             self.tavily_base_url,
             allowed_hosts=tavily_allowed_hosts,
@@ -180,6 +186,10 @@ class Settings(BaseSettings):
     @property
     def tavily_host_allowlist(self) -> frozenset[str]:
         return parse_host_allowlist(self.tavily_allowed_hosts)
+
+    @property
+    def tavily_excluded_domain_set(self) -> frozenset[str]:
+        return parse_host_allowlist(self.tavily_excluded_domains)
 
     @property
     def booking_host_allowlist(self) -> frozenset[str]:
@@ -198,6 +208,11 @@ class Settings(BaseSettings):
             return (
                 "TAVILY_ENABLED is true but TAVILY_API_KEY is empty; "
                 "attractions will use the labelled stub fallback.",
+            )
+        if self.tavily_configured and not self.groq_configured:
+            return (
+                "Tavily is configured but GROQ_API_KEY is empty; grounded attraction "
+                "extraction will use the labelled stub fallback.",
             )
         return ()
 

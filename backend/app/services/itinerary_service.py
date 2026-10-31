@@ -24,6 +24,8 @@ class ItineraryService:
         current_time = as_india_time(now or india_now())
         attraction_names: dict[str, list[str]] = defaultdict(list)
         for attraction in attractions or []:
+            if attraction.source_url is None or attraction.entry_fee.source == "stub":
+                continue
             names = attraction_names[attraction.destination]
             if attraction.name not in names and len(names) < 3:
                 names.append(attraction.name)

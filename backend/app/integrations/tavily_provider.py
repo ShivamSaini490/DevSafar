@@ -1,12 +1,14 @@
 import asyncio
 import hashlib
+import html
 import logging
 import re
+import unicodedata
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
+from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
-from ipaddress import ip_address
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -14,11 +16,15 @@ import httpx
 from pydantic import BaseModel, ConfigDict, HttpUrl, TypeAdapter, ValidationError
 from redis.asyncio import Redis
 
+from app.agents.llm import AttractionExtractor
 from app.core.config import Settings
-from app.schemas.attraction import AttractionOption
+from app.schemas.attraction import AttractionCandidate, AttractionOption
 from app.schemas.common import PriceQuote
 from app.schemas.trip import TripRequirements
-from app.utils.url_validator import validate_external_base_url
+from app.utils.url_validator import (
+    validate_external_base_url,
+    validate_public_https_url,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -32,12 +38,37 @@ _FEE_PATTERN = re.compile(
     r"(\d[\d,]*(?:\.\d{1,2})?)",
     flags=re.IGNORECASE,
 )
-_HOURS_PATTERN = re.compile(
-    r"\b(?:open(?:ing)?\s+hours?\s*[:\-]?\s*)?"
-    r"(\d{1,2}(?::[0-5]\d)?\s*(?:a\.?m\.?|p\.?m\.?))"
+_OPEN_FROM_PATTERN = re.compile(
+    r"\bopen(?:s)?\s+from\s+"
+    r"(\d{1,2}:[0-5]\d\s*(?:a\.?m\.?|p\.?m\.?)?)"
     r"\s*(?:-|–|—|to)\s*"
-    r"(\d{1,2}(?::[0-5]\d)?\s*(?:a\.?m\.?|p\.?m\.?))\b",
+    r"(\d{1,2}:[0-5]\d\s*(?:a\.?m\.?|p\.?m\.?)?)\b",
     flags=re.IGNORECASE,
+)
+_OPENS_AT_PATTERN = re.compile(
+    r"\bopens\s+at\s+(\d{1,2}:[0-5]\d\s*(?:a\.?m\.?|p\.?m\.?)?)\b",
+    flags=re.IGNORECASE,
+)
+_MARKDOWN_IMAGE_PATTERN = re.compile(r"!\[([^\]]*)\]\([^)]*\)")
+_MARKDOWN_LINK_PATTERN = re.compile(r"\[([^\]]+)\]\([^)]*\)")
+_HTML_TAG_PATTERN = re.compile(r"<[^>]+>")
+_RAW_URL_PATTERN = re.compile(r"https?://\S+", flags=re.IGNORECASE)
+_PAGE_TITLE_PHRASES = (
+    "places to visit",
+    "things to do",
+    "tourism in",
+    "travel guide",
+    "tourist attractions in",
+    "wikipedia",
+    "youtube",
+)
+_INSTRUCTION_PHRASES = (
+    "ignore all",
+    "ignore previous",
+    "system prompt",
+    "follow these instructions",
+    "return fake",
+    "call a tool",
 )
 
 
@@ -55,6 +86,14 @@ class _TavilyResponse(BaseModel):
     results: list[_TavilyResult]
 
 
+@dataclass(frozen=True, slots=True)
+class _SourceSnippet:
+    title: str
+    url: str
+    domain: str
+    content: str
+
+
 _ATTRACTION_LIST = TypeAdapter(list[AttractionOption])
 _HTTP_URL = TypeAdapter(HttpUrl)
 
@@ -68,12 +107,14 @@ class TavilyAttractionsProvider:
         redis: Redis,
         *,
         fetched_at: datetime,
+        extractor: AttractionExtractor,
         client: httpx.AsyncClient | None = None,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     ) -> None:
         self.settings = settings
         self.redis = redis
         self.fetched_at = fetched_at
+        self.extractor = extractor
         self.client = client
         self._sleep = sleep
         self._base_url = validate_external_base_url(
@@ -110,12 +151,35 @@ class TavilyAttractionsProvider:
             if payload is None:
                 attractions.append(self._fallback(destination))
                 continue
-            parsed = self._extract(destination, payload)
-            if not parsed:
+            snippets = self._eligible_snippets(payload)
+            if not snippets:
                 attractions.append(self._fallback(destination))
                 continue
-            attractions.extend(parsed)
-            await self._write_cache(destination, parsed)
+            try:
+                candidates = await self.extractor.extract_attractions(
+                    city=destination,
+                    snippets=[snippet.content for snippet in snippets],
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Groq attraction extraction failed; using stub fallback",
+                    extra={
+                        "error_type": getattr(exc, "error_type", type(exc).__name__),
+                        "http_status": getattr(exc, "http_status", None),
+                    },
+                )
+                attractions.append(self._fallback(destination))
+                continue
+            grounded = self._ground_candidates(
+                destination,
+                candidates,
+                snippets,
+            )
+            if not grounded:
+                attractions.append(self._fallback(destination))
+                continue
+            attractions.extend(grounded)
+            await self._write_cache(destination, grounded)
         return attractions
 
     async def _search(self, city: str) -> _TavilyResponse | None:
@@ -137,6 +201,7 @@ class TavilyAttractionsProvider:
             "include_answer": False,
             "include_raw_content": False,
             "include_images": False,
+            "exclude_domains": sorted(self.settings.tavily_excluded_domain_set),
         }
         for attempt in range(MAX_RETRIES + 1):
             try:
@@ -176,47 +241,127 @@ class TavilyAttractionsProvider:
                 timeout=self.settings.tavily_timeout_seconds,
             )
 
-    def _extract(
-        self, destination: str, payload: _TavilyResponse
+    def _eligible_snippets(self, payload: _TavilyResponse) -> list[_SourceSnippet]:
+        snippets: list[_SourceSnippet] = []
+        excluded = self.settings.tavily_excluded_domain_set
+        for result in payload.results:
+            if not result.url or not result.content.strip():
+                continue
+            try:
+                source_url = validate_public_https_url(result.url)
+            except ValueError:
+                continue
+            domain = (urlsplit(source_url).hostname or "").casefold().rstrip(".")
+            if any(domain == blocked or domain.endswith(f".{blocked}") for blocked in excluded):
+                continue
+            snippets.append(
+                _SourceSnippet(
+                    title=result.title,
+                    url=source_url,
+                    domain=domain,
+                    content=result.content,
+                )
+            )
+        return snippets
+
+    def _ground_candidates(
+        self,
+        destination: str,
+        candidates: list[AttractionCandidate],
+        snippets: list[_SourceSnippet],
     ) -> list[AttractionOption]:
         items: list[AttractionOption] = []
-        for result in payload.results:
-            source_url_text = self._safe_source_url(result.url)
-            if source_url_text is None:
+        seen_names: set[str] = set()
+        title_names = {
+            self._normalize_for_grounding(snippet.title) for snippet in snippets
+        }
+        for candidate in candidates:
+            name = self._clean_plain_text(candidate.name, limit=120)
+            normalized_name = self._normalize_for_grounding(name)
+            if (
+                not normalized_name
+                or normalized_name in seen_names
+                or normalized_name in title_names
+                or self._looks_like_page_title(name)
+            ):
                 continue
-            name = self._clean_text(result.title, limit=200)
-            if not name:
+            grounded = self._find_grounded_snippet(
+                normalized_name=normalized_name,
+                evidence_quote=candidate.evidence_quote,
+                snippets=snippets,
+            )
+            if grounded is None:
                 continue
-            description = self._clean_text(result.content, limit=1000)
-            amount = self._parse_fee(result.content)
-            opening_hours = self._parse_opening_hours(result.content)
-            source_domain = (
-                urlsplit(source_url_text).hostname or ""
-            ).casefold().rstrip(".")
+            snippet, evidence_sentence = grounded
+            description = self._clean_plain_text(evidence_sentence, limit=200)
+            if not description:
+                continue
+            amount = self._parse_fee(evidence_sentence)
+            opening_hours = self._parse_opening_hours(evidence_sentence)
+            extra_urls: list[str] = []
+            for other in snippets:
+                if (
+                    other.url == snippet.url
+                    or other.url in extra_urls
+                    or normalized_name
+                    not in self._normalize_for_grounding(other.content)
+                ):
+                    continue
+                extra_urls.append(other.url)
+                if len(extra_urls) == 2:
+                    break
             try:
-                source_url = _HTTP_URL.validate_python(source_url_text)
+                source_url = _HTTP_URL.validate_python(snippet.url)
                 items.append(
                     AttractionOption(
                         destination=destination,
                         name=name,
-                        description=(
-                            description or "Source page contains the attraction details."
-                        ),
+                        category=candidate.category,
+                        description=description,
                         entry_fee=PriceQuote(
                             amount=amount,
                             price_type="estimate" if amount is not None else "unknown",
-                            source=source_url_text,
+                            source=snippet.url,
                             fetched_at=self.fetched_at,
                         ),
                         opening_hours=opening_hours,
                         source_url=source_url,
-                        source_domain=source_domain,
+                        additional_source_urls=[
+                            _HTTP_URL.validate_python(url) for url in extra_urls
+                        ],
+                        source_domain=snippet.domain,
                         fetched_at=self.fetched_at,
                     )
                 )
             except (ValidationError, ValueError):
                 continue
+            seen_names.add(normalized_name)
+            if len(items) >= self.settings.attractions_per_destination:
+                break
         return items
+
+    @classmethod
+    def _find_grounded_snippet(
+        cls,
+        *,
+        normalized_name: str,
+        evidence_quote: str,
+        snippets: list[_SourceSnippet],
+    ) -> tuple[_SourceSnippet, str] | None:
+        for snippet in snippets:
+            if evidence_quote not in snippet.content:
+                continue
+            if normalized_name not in cls._normalize_for_grounding(snippet.content):
+                continue
+            if normalized_name not in cls._normalize_for_grounding(evidence_quote):
+                continue
+            if any(
+                phrase in evidence_quote.casefold()
+                for phrase in _INSTRUCTION_PHRASES
+            ):
+                continue
+            return snippet, evidence_quote.strip()
+        return None
 
     async def _read_cache(self, city: str) -> list[AttractionOption] | None:
         key = self._cache_key(city)
@@ -268,8 +413,36 @@ class TavilyAttractionsProvider:
         )
 
     @staticmethod
-    def _clean_text(value: str, *, limit: int) -> str:
-        return " ".join(value.replace("\x00", " ").split())[:limit]
+    def _clean_plain_text(value: str, *, limit: int) -> str:
+        cleaned = html.unescape(value.replace("\x00", " "))
+        cleaned = _MARKDOWN_IMAGE_PATTERN.sub(r"\1", cleaned)
+        cleaned = _MARKDOWN_LINK_PATTERN.sub(r"\1", cleaned)
+        cleaned = _HTML_TAG_PATTERN.sub(" ", cleaned)
+        cleaned = _RAW_URL_PATTERN.sub(" ", cleaned)
+        cleaned = re.sub(r"[`*_~#>|]+", " ", cleaned)
+        cleaned = "".join(
+            character
+            for character in cleaned
+            if unicodedata.category(character) not in {"So", "Sk", "Cs", "Cf"}
+        )
+        cleaned = " ".join(cleaned.split())
+        cleaned = re.sub(r"\s+([.,;:!?])", r"\1", cleaned)
+        return cleaned[:limit].strip()
+
+    @staticmethod
+    def _normalize_for_grounding(value: str) -> str:
+        return "".join(
+            character
+            for character in html.unescape(value).casefold()
+            if character.isalnum()
+        )
+
+    @staticmethod
+    def _looks_like_page_title(name: str) -> bool:
+        lowered = name.casefold()
+        return any(phrase in lowered for phrase in _PAGE_TITLE_PHRASES) or bool(
+            re.match(r"^\d+\s+", name)
+        )
 
     @staticmethod
     def _city_for_query(value: str) -> str:
@@ -293,30 +466,15 @@ class TavilyAttractionsProvider:
 
     @staticmethod
     def _parse_opening_hours(text: str) -> str | None:
-        match = _HOURS_PATTERN.search(text)
-        if match is None:
-            return None
-        return " - ".join(" ".join(value.split()) for value in match.groups())
-
-    @staticmethod
-    def _safe_source_url(value: str | None) -> str | None:
-        if not value:
-            return None
-        parsed = urlsplit(value.strip())
-        if parsed.scheme.casefold() != "https" or parsed.username or parsed.password:
-            return None
-        hostname = (parsed.hostname or "").casefold().rstrip(".")
-        if not hostname or hostname == "localhost" or hostname.endswith(
-            (".localhost", ".local", ".internal")
-        ):
-            return None
-        try:
-            address = ip_address(hostname)
-        except ValueError:
-            address = None
-        if address is not None and not address.is_global:
-            return None
-        return value.strip()
+        range_match = _OPEN_FROM_PATTERN.search(text)
+        if range_match is not None:
+            return " - ".join(
+                " ".join(value.split()) for value in range_match.groups()
+            )
+        at_match = _OPENS_AT_PATTERN.search(text)
+        if at_match is not None:
+            return f"Opens at {' '.join(at_match.group(1).split())}"
+        return None
 
     @staticmethod
     def _log_failure(error_type: str, http_status: int | None) -> None:
@@ -328,4 +486,4 @@ class TavilyAttractionsProvider:
     @staticmethod
     def _cache_key(city: str) -> str:
         digest = hashlib.sha256(city.casefold().strip().encode("utf-8")).hexdigest()
-        return f"devsafar:tavily:attractions:v1:{digest}"
+        return f"devsafar:tavily:attractions:v2:{digest}"

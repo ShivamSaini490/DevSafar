@@ -56,16 +56,28 @@ misses with `TAVILY_MAX_SEARCHES_PER_TRIP` (default 2), and caches each city in 
 most one retry. Disabled service, exhausted credits, invalid data, or network failure
 falls back to labelled stub attractions without failing the trip.
 
-Tavily web text is treated only as untrusted data. Attraction names/descriptions are
-parsed deterministically; instructions embedded in snippets are never executed. Source
-URLs are required for Tavily items. Entry fees and opening hours are included only when
-Python recognizes explicit numeric/time patterns. Such fees are estimates tied to the
-source URL, never live quotes.
+Tavily web text is treated only as untrusted data. Social/video results configured in
+`TAVILY_EXCLUDED_DOMAINS` are removed first. For each uncached destination, one Groq
+structured-output call proposes named places and verbatim evidence; Python then requires
+the normalized name and evidence to exist in the same snippet, rejects page titles,
+deduplicates names, and caps results with `ATTRACTIONS_PER_DESTINATION` (default 6).
+Only the grounded place objects are cached (`v2` cache key), so a cache hit calls neither
+Tavily nor Groq. Extraction failure or zero grounded results returns the labelled unknown
+fallback and marks the Tavily data source degraded.
+
+Descriptions are built in Python from the grounded evidence sentence, stripped of HTML,
+Markdown, links, emoji, and excess whitespace, then limited to 200 characters. Fees and
+opening hours are parsed only from that same sentence; fees remain estimates tied to the
+grounding URL and are never live quotes. The frontend must render attraction names,
+categories, descriptions, and itinerary notes as plain text only, never as HTML or via an
+HTML-injection API.
 
 `booking_links` contains plain HTTPS search/main-page redirects for IRCTC, MakeMyTrip,
-redBus, Google Flights, and Booking.com. No affiliate or invented route parameters are
-added. Every redirect host is checked against `BOOKING_ALLOWED_HOSTS`; opening one is
-not a confirmed booking and no price is implied.
+redBus, Google Flights, and Booking.com. Transport links are grouped by `leg_index`;
+hotel links are grouped by `stay_index` and carry that stay city's check-in/check-out
+dates. No affiliate or invented route parameters are added. Every redirect host is checked
+against `BOOKING_ALLOWED_HOSTS`; opening one is not a confirmed booking and no price is
+implied. Flight links also tell the user to verify the nearest-airport availability.
 
 Road schedules start driving days at 06:00 India time. `MAX_DRIVING_HOURS_PER_DAY`
 limits cumulative driving time per calendar day, while `DRIVING_LATEST_ARRIVAL_HOUR`

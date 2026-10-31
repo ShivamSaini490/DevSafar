@@ -1,7 +1,7 @@
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from decimal import Decimal
-from typing import Protocol
+from typing import Literal, Protocol
 
 from app.schemas.attraction import AttractionOption
 from app.schemas.common import DataSource, PriceQuote, PriceType
@@ -107,7 +107,7 @@ class StubHotelProvider:
         return [
             HotelOption(
                 destination=destination,
-                name=f"Stub stay in {destination}",
+                name=f"Estimated stay budget in {destination} (no live hotel data)",
                 check_in=requirements.start_date,
                 check_out=requirements.start_date + timedelta(days=per_destination),
                 nightly_price=PriceQuote(
@@ -209,10 +209,27 @@ def provider_sources(
         if bundle.maps_source_name == "osrm"
         else ("stub_transport", "estimate")
     )
-    sources: tuple[tuple[str, PriceType], ...] = (
-        (bundle.maps_source_name, maps_price_type),
-        transport_source,
-        ("stub_hotels", "estimate"),
+    tavily_degraded = bundle.places_source_name == "tavily" and (
+        not attractions
+        or any(
+            item.source_url is None or item.entry_fee.source == "stub"
+            for item in attractions
+        )
+    )
+    sources: tuple[
+        tuple[str, PriceType, Literal["ok", "degraded"]], ...
+    ] = (
+        (
+            bundle.maps_source_name,
+            maps_price_type,
+            "degraded" if bundle.maps_source_name.startswith("stub") else "ok",
+        ),
+        (
+            transport_source[0],
+            transport_source[1],
+            "degraded" if transport_source[0].startswith("stub") else "ok",
+        ),
+        ("stub_hotels", "estimate", "degraded"),
         (
             bundle.places_source_name,
             (
@@ -224,9 +241,19 @@ def provider_sources(
                 )
                 else "unknown"
             ),
+            (
+                "degraded"
+                if tavily_degraded or bundle.places_source_name.startswith("stub")
+                else "ok"
+            ),
         ),
     )
     return [
-        DataSource(name=name, price_type=price_type, fetched_at=fetched_at)
-        for name, price_type in sources
+        DataSource(
+            name=name,
+            price_type=price_type,
+            fetched_at=fetched_at,
+            status=status,
+        )
+        for name, price_type, status in sources
     ]

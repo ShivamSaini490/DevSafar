@@ -77,3 +77,34 @@ def validate_external_url(url: str, *, allowed_hosts: frozenset[str]) -> str:
     if hostname not in allowed_hosts:
         raise ValueError("External URL hostname is not allowlisted")
     return urlunsplit(("https", parsed.netloc, parsed.path or "/", parsed.query, ""))
+
+
+def validate_public_https_url(url: str) -> str:
+    """Validate an untrusted public HTTPS source URL without fetching it."""
+
+    parsed = urlsplit(url.strip())
+    if parsed.scheme.casefold() != "https":
+        raise ValueError("Source URLs must use HTTPS")
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError("Source URLs must not contain credentials")
+    if parsed.fragment:
+        raise ValueError("Source URLs must not contain fragments")
+    hostname = (parsed.hostname or "").casefold().rstrip(".")
+    if not hostname:
+        raise ValueError("Source URL must contain a hostname")
+    if hostname == "localhost" or hostname.endswith((".localhost", ".local", ".internal")):
+        raise ValueError("Source URL uses a blocked local hostname")
+    try:
+        address = ip_address(hostname)
+    except ValueError:
+        address = None
+    if address is not None and (
+        address.is_private
+        or address.is_loopback
+        or address.is_link_local
+        or address.is_multicast
+        or address.is_reserved
+        or address.is_unspecified
+    ):
+        raise ValueError("Source URL resolves to a blocked IP class")
+    return urlunsplit(("https", parsed.netloc, parsed.path or "/", parsed.query, ""))

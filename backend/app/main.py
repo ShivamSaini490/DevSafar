@@ -11,6 +11,7 @@ from starlette.datastructures import MutableHeaders
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from app.agents.graph import LangGraphTripPlanner
+from app.agents.llm import GroqAttractionExtractor
 from app.api.router import api_router
 from app.core.config import Settings, get_settings
 from app.core.exceptions import handle_unexpected_exception, register_exception_handlers
@@ -66,9 +67,12 @@ def _lifespan(settings: Settings) -> Callable[[FastAPI], AbstractAsyncContextMan
         app.state.db_session_factory = session_factory
         app.state.redis = redis
         provider_http_client: httpx.AsyncClient | None = None
+        attraction_extractor: GroqAttractionExtractor | None = None
         if not hasattr(app.state, "trip_planner"):
             if settings.maps_provider == "osm" or settings.tavily_configured:
                 provider_http_client = httpx.AsyncClient()
+            if settings.tavily_configured:
+                attraction_extractor = GroqAttractionExtractor(settings)
 
             if settings.maps_provider == "osm":
                 assert provider_http_client is not None
@@ -84,11 +88,13 @@ def _lifespan(settings: Settings) -> Callable[[FastAPI], AbstractAsyncContextMan
                         source_name="osrm",
                     )
                     if settings.tavily_configured:
+                        assert attraction_extractor is not None
                         bundle = bundle.with_places(
                             TavilyAttractionsProvider(
                                 settings,
                                 redis,
                                 fetched_at=fetched_at,
+                                extractor=attraction_extractor,
                                 client=provider_http_client,
                             ),
                             source_name="tavily",
@@ -101,6 +107,7 @@ def _lifespan(settings: Settings) -> Callable[[FastAPI], AbstractAsyncContextMan
                 )
             elif settings.tavily_configured:
                 assert provider_http_client is not None
+                assert attraction_extractor is not None
 
                 def tavily_provider_factory(fetched_at: datetime) -> ProviderBundle:
                     return ProviderBundle.stubs(fetched_at).with_places(
@@ -108,6 +115,7 @@ def _lifespan(settings: Settings) -> Callable[[FastAPI], AbstractAsyncContextMan
                             settings,
                             redis,
                             fetched_at=fetched_at,
+                            extractor=attraction_extractor,
                             client=provider_http_client,
                         ),
                         source_name="tavily",

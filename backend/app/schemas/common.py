@@ -1,9 +1,10 @@
 
-from datetime import date, datetime
+from datetime import date as Date
+from datetime import datetime
 from decimal import Decimal
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, HttpUrl, model_validator
+from pydantic import BaseModel, ConfigDict, Field, HttpUrl, field_validator, model_validator
 
 PriceType = Literal["live_quote", "estimate", "unknown"]
 Currency = Literal["INR"]
@@ -33,6 +34,7 @@ class DataSource(StrictSchema):
     name: str = Field(min_length=1, max_length=100)
     price_type: PriceType
     fetched_at: datetime
+    status: Literal["ok", "degraded"] = "ok"
 
 
 class BookingLink(StrictSchema):
@@ -40,11 +42,24 @@ class BookingLink(StrictSchema):
     mode: Literal["train", "bus", "flight", "hotel"]
     label: str = Field(min_length=1, max_length=200)
     url: HttpUrl
-    origin: str = Field(min_length=1, max_length=200)
+    origin: str | None = Field(default=None, min_length=1, max_length=200)
     destination: str = Field(min_length=1, max_length=200)
-    date: date
+    date: Date
+    leg_index: int | None = Field(default=None, ge=0)
+    stay_index: int | None = Field(default=None, ge=0)
+    check_in: Date | None = None
+    check_out: Date | None = None
     link_type: Literal["search_page"] = "search_page"
     price_known: Literal[False] = False
-    note: Literal["Opening a provider page is not a confirmed booking."] = (
-        "Opening a provider page is not a confirmed booking."
+    note: str = Field(
+        default="Opening a provider page is not a confirmed booking.",
+        min_length=1,
+        max_length=300,
     )
+
+    @field_validator("note")
+    @classmethod
+    def require_booking_disclaimer(cls, value: str) -> str:
+        if "Opening a provider page is not a confirmed booking." not in value:
+            raise ValueError("Booking links must retain the unconfirmed-booking notice")
+        return value
