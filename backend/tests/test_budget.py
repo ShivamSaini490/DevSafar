@@ -2,7 +2,9 @@ from datetime import date, datetime
 from decimal import Decimal
 from uuid import uuid4
 
+from app.schemas.attraction import AttractionOption
 from app.schemas.budget import BudgetBreakdown
+from app.schemas.common import PriceQuote
 from app.schemas.trip import TripRequirements, TripResponse
 from app.services.budget_service import BudgetService
 from app.utils.datetime_utils import INDIA_TIME_ZONE
@@ -55,6 +57,61 @@ def test_configured_food_and_buffer_rules_are_labelled_estimates() -> None:
     assert food.price_type == buffer.price_type == "estimate"
     assert budget.known_subtotal == Decimal("3300.00")
     assert budget.total_estimated == Decimal("3300.00")
+
+
+def test_known_attraction_fees_feed_subtotal_while_unknown_fee_stays_unknown() -> None:
+    fetched_at = datetime(2026, 10, 30, tzinfo=INDIA_TIME_ZONE)
+    requirements = TripRequirements(
+        origin="Hyderabad",
+        destinations=["Vijayawada"],
+        start_date=date(2026, 10, 30),
+        end_date=date(2026, 11, 1),
+    )
+    attractions = [
+        AttractionOption(
+            destination="Vijayawada",
+            name="Known fee attraction",
+            description="Provider text",
+            entry_fee=PriceQuote(
+                amount=Decimal("250"),
+                price_type="estimate",
+                source="https://example.com/known",
+                fetched_at=fetched_at,
+            ),
+            source_url="https://example.com/known",
+            source_domain="example.com",
+            fetched_at=fetched_at,
+        ),
+        AttractionOption(
+            destination="Vijayawada",
+            name="Unknown fee attraction",
+            description="Provider text without a numeric fee",
+            entry_fee=PriceQuote(
+                amount=None,
+                price_type="unknown",
+                source="https://example.com/unknown",
+                fetched_at=fetched_at,
+            ),
+            source_url="https://example.com/unknown",
+            source_domain="example.com",
+            fetched_at=fetched_at,
+        ),
+    ]
+
+    budget = BudgetService.build(
+        requirements=requirements,
+        transport_options=[],
+        hotels=[],
+        attractions=attractions,
+    )
+
+    attraction_category = next(
+        category for category in budget.categories if category.name == "Attractions"
+    )
+    assert attraction_category.amount == Decimal("250")
+    assert budget.known_subtotal == Decimal("250")
+    assert budget.total_estimated is None
+    assert "Attractions (unpriced entries)" in budget.unknown_categories
 
 
 def test_migration_0003_json_without_new_summary_fields_still_loads() -> None:

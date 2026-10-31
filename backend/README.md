@@ -37,13 +37,35 @@ values, and neither raw value is used as a key or logged. The endpoint returns t
 labelled structured trip response from the same in-request graph. Temporary results and
 follow-up context stay only in bounded Redis state and never create trip or itinerary rows.
 
-The LangGraph vertical slice runs five nodes in-request: intent, stub research,
+The LangGraph vertical slice runs five nodes in-request: intent, provider research,
 deterministic planning, deterministic validation, and response. Groq is used only for
 structured intent extraction; dates, durations, budgets, totals, retries, and feasibility
-are calculated in Python. Maps, transport, hotel, and places integrations are clearly
-labelled stubs and never emit `live_quote`. Configure `GROQ_MODEL`,
+are calculated in Python. Maps, transport, and hotel fallbacks remain clearly labelled
+stubs and never emit `live_quote`. Configure `GROQ_MODEL`,
 `GROQ_TIMEOUT_SECONDS`, and `GRAPH_TIMEOUT_SECONDS` as needed. Missing or failed Groq
 configuration returns a public-safe `503` instead of an internal error.
+
+## Tavily attraction research and booking redirects
+
+Tavily is opt-in with `TAVILY_ENABLED=false` by default. When enabled, set
+`TAVILY_API_KEY` in the environment, keep `TAVILY_BASE_URL=https://api.tavily.com`, and
+allowlist that exact host with `TAVILY_ALLOWED_HOSTS`. DevSafar sends only a fixed query
+containing the destination city, uses Basic search (1 credit per search), caps cache
+misses with `TAVILY_MAX_SEARCHES_PER_TRIP` (default 2), and caches each city in Redis for
+`TAVILY_CACHE_TTL_SECONDS` (default seven days). Requests have a bounded timeout and at
+most one retry. Disabled service, exhausted credits, invalid data, or network failure
+falls back to labelled stub attractions without failing the trip.
+
+Tavily web text is treated only as untrusted data. Attraction names/descriptions are
+parsed deterministically; instructions embedded in snippets are never executed. Source
+URLs are required for Tavily items. Entry fees and opening hours are included only when
+Python recognizes explicit numeric/time patterns. Such fees are estimates tied to the
+source URL, never live quotes.
+
+`booking_links` contains plain HTTPS search/main-page redirects for IRCTC, MakeMyTrip,
+redBus, Google Flights, and Booking.com. No affiliate or invented route parameters are
+added. Every redirect host is checked against `BOOKING_ALLOWED_HOSTS`; opening one is
+not a confirmed booking and no price is implied.
 
 Road schedules start driving days at 06:00 India time. `MAX_DRIVING_HOURS_PER_DAY`
 limits cumulative driving time per calendar day, while `DRIVING_LATEST_ARRIVAL_HOUR`

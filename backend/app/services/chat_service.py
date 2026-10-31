@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from decimal import Decimal
 from uuid import UUID
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -20,17 +21,42 @@ class SavedChatTurn:
 
 
 def summarize_trip(response: TripResponse) -> str:
+    feasibility = (
+        "yes" if response.feasible is True else "no" if response.feasible is False else "unknown"
+    )
     if response.status == "needs_clarification":
-        return "I need a few details before planning: " + " ".join(response.warnings)
-    if response.feasible is True:
-        return "A source-labelled draft trip plan is ready. Verify unknown prices before booking."
-    if response.feasible is None:
-        return (
-            "A source-labelled draft trip plan is ready. "
-            "Feasibility cannot yet be verified. "
-            + " ".join(response.warnings)
+        reason = "critical trip details are missing"
+    elif response.feasible is False:
+        reason = response.warnings[0] if response.warnings else "a current constraint is blocking the plan"
+    elif response.feasible is None:
+        reason_warning = next(
+            (
+                warning
+                for warning in response.warnings
+                if warning.startswith("Feasibility cannot be verified")
+            ),
+            "provider-backed timing or pricing is incomplete",
         )
-    return "This plan is not feasible with the current constraints. " + " ".join(response.warnings)
+        reason = reason_warning.partition(":")[2].strip() or reason_warning
+    else:
+        reason = "the verified schedule meets the current deadline and known constraints"
+
+    known_cost = _format_inr(response.budget.known_subtotal)
+    if response.requirements.budget is None:
+        cost_sentence = f"Known cost is INR {known_cost}; no budget was specified."
+    else:
+        cost_sentence = (
+            f"Known cost is INR {known_cost} against a budget of INR "
+            f"{_format_inr(response.requirements.budget)}."
+        )
+    clean_reason = reason.rstrip(".?!").lower()
+    return f"Feasibility: {feasibility}. Main reason: {clean_reason}. {cost_sentence}"
+
+
+def _format_inr(value: Decimal) -> str:
+    if value == value.to_integral_value():
+        return f"{value:,.0f}"
+    return f"{value:,.2f}"
 
 
 class ChatService:

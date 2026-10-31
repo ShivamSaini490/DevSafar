@@ -1,3 +1,4 @@
+from decimal import Decimal
 from typing import Any
 
 from app.agents.state import TravelState
@@ -42,7 +43,16 @@ async def validation_node(state: TravelState) -> dict[str, Any]:
         and return_arrival > requirements.return_deadline
     ):
         errors.append("The computed return arrival misses the required return deadline.")
-    if requirements.budget is not None and budget.known_subtotal > requirements.budget:
+    feasibility_subtotal = sum(
+        (
+            category.amount
+            for category in budget.categories
+            if category.amount is not None
+            and not category.name.casefold().startswith("attractions")
+        ),
+        start=Decimal("0"),
+    )
+    if requirements.budget is not None and feasibility_subtotal > requirements.budget:
         errors.append("Known subtotal already exceeds the requested budget.")
 
     all_prices = [

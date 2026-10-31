@@ -3,7 +3,7 @@ from datetime import datetime
 from typing import Any
 from uuid import uuid4
 
-from app.agents.llm import IntentModel
+from app.agents.llm import RETURN_TIME_ASSUMPTION, IntentModel
 from app.agents.state import TravelState
 from app.schemas.budget import empty_budget
 from app.schemas.trip import TripRequirements, TripResponse
@@ -42,14 +42,11 @@ def _critical_questions(
 
 def _assumption_warning(ambiguity: str) -> str | None:
     cleaned = " ".join(ambiguity.split())
-    if not cleaned:
-        return None
-    normalized = cleaned.casefold()
-    if "traveler" in normalized or "passenger" in normalized:
-        return "Travelers not specified; assuming 1."
-    if "time zone" in normalized or "timezone" in normalized:
-        return "Return deadline timezone assumed Asia/Kolkata."
-    return cleaned
+    allowed_assumptions = {
+        "Travelers not specified; assuming 1.",
+        RETURN_TIME_ASSUMPTION,
+    }
+    return cleaned if cleaned in allowed_assumptions else None
 
 
 def _planning_warnings(requirements: TripRequirements) -> list[str]:
@@ -58,10 +55,6 @@ def _planning_warnings(requirements: TripRequirements) -> list[str]:
         for ambiguity in requirements.ambiguities
         if (warning := _assumption_warning(ambiguity)) is not None
     ]
-    if requirements.budget is None:
-        warnings.append("Budget not specified; planning with budget unknown.")
-    if requirements.return_deadline is None:
-        warnings.append("Return deadline not specified; deadline validation skipped.")
     return list(dict.fromkeys(warnings))
 
 

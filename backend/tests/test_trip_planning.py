@@ -44,6 +44,24 @@ class FakeGroqBadRequest(RuntimeError):
         self.body = body
 
 
+def _complete_intent_payload(
+    *,
+    return_deadline: str,
+    ambiguities: list[str] | None = None,
+) -> dict[str, object]:
+    return {
+        "origin": "Hyderabad",
+        "destinations": ["Vijayawada"],
+        "start_date": "31 Oct",
+        "end_date": "4 Nov",
+        "travelers": 1,
+        "budget": "INR 20000",
+        "return_deadline": return_deadline,
+        "preferences": [],
+        "ambiguities": ambiguities or [],
+    }
+
+
 def _configured_groq_settings(
     settings: Settings,
     *,
@@ -89,6 +107,82 @@ async def _signup_and_login(client: AsyncClient, payload: dict[str, str]) -> Non
 
 def _csrf_headers(client: AsyncClient) -> dict[str, str]:
     return {"X-CSRF-Token": client.cookies["csrf_token"]}
+
+
+@pytest.mark.asyncio
+async def test_hinglish_morning_return_time_overrides_provider_midnight(
+    settings: Settings,
+) -> None:
+    fake_client = FakeIntentCompletionClient(
+        _complete_intent_payload(
+            return_deadline="2026-11-05T00:00:00",
+            ambiguities=[
+                "Exact return time not specified",
+                "Currency assumed INR",
+                "Timezone assumed Asia/Kolkata",
+            ],
+        )
+    )
+    groq_settings = _configured_groq_settings(settings, api_key="gsk_hinglish_test_key")
+    model = GroqIntentModel(
+        groq_settings,
+        client=fake_client,
+        today_provider=lambda: date(2026, 10, 30),
+    )
+
+    requirements = await model.extract_requirements(
+        user_prompt=(
+            "31 Oct se 4 Nov Hyderabad se Vijayawada trip, "
+            "5 Nov subah 10 baje tak wapas, budget INR 20000"
+        ),
+        previous_trip=None,
+    )
+
+    assert requirements.return_deadline == datetime(
+        2026, 11, 5, 10, 0, tzinfo=INDIA_TIME_ZONE
+    )
+    assert requirements.ambiguities == []
+    system_message = str(fake_client.inputs[0][0].content)  # type: ignore[index,union-attr]
+    for example in ("subah 10 baje", "dopahar 2 baje", "shaam 7 baje", "raat 10 baje"):
+        assert example in system_message
+
+
+@pytest.mark.asyncio
+async def test_return_date_without_time_defaults_to_end_of_day_and_warns(
+    settings: Settings,
+) -> None:
+    fake_client = FakeIntentCompletionClient(
+        _complete_intent_payload(
+            return_deadline="2026-11-05T00:00:00",
+            ambiguities=["Exact return time not specified", "Currency assumed INR"],
+        )
+    )
+    groq_settings = _configured_groq_settings(settings, api_key="gsk_no_time_test_key")
+    model = GroqIntentModel(
+        groq_settings,
+        client=fake_client,
+        today_provider=lambda: date(2026, 10, 30),
+    )
+    response = await LangGraphTripPlanner(
+        groq_settings,
+        intent_model=model,
+        now_provider=lambda: datetime(2026, 10, 30, 5, 0, tzinfo=INDIA_TIME_ZONE),
+    ).run(
+        conversation_id=None,
+        user_prompt="31 Oct se 4 Nov Hyderabad se Vijayawada, 5 Nov tak wapas",
+        previous_trip=None,
+        chat_mode="temporary",
+    )
+
+    assert response.requirements.return_deadline == datetime(
+        2026, 11, 5, 23, 59, tzinfo=INDIA_TIME_ZONE
+    )
+    assert "Return time not specified; assuming 23:59 Asia/Kolkata." in response.warnings
+    assert not any(
+        noise in warning.casefold()
+        for warning in response.warnings
+        for noise in ("currency assumed", "timezone assumed", "time zone assumed")
+    )
 
 
 @pytest.mark.asyncio
@@ -327,7 +421,7 @@ async def test_realistic_groq_json_normalizes_full_example_prompt(
     assert trip["budget"]["known_subtotal"] == "10500.00"
     assert trip["budget"]["unknown_categories"] == ["Attractions"]
     assert "Travelers not specified; assuming 1." in trip["warnings"]
-    assert "Return deadline timezone assumed Asia/Kolkata." in trip["warnings"]
+    assert not any("timezone" in warning.casefold() for warning in trip["warnings"])
     assert (
         "Feasibility cannot be verified: transport times are unverified/stub." in trip["warnings"]
     )

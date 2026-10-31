@@ -117,7 +117,7 @@ async def test_missing_critical_info_ends_before_research(settings: Settings) ->
 
 
 @pytest.mark.asyncio
-async def test_ambiguities_alone_do_not_block_planning(settings: Settings) -> None:
+async def test_model_ambiguities_do_not_leak_into_user_warnings(settings: Settings) -> None:
     model = StaticIntentModel(
         TripRequirements(
             origin="Hyderabad",
@@ -149,12 +149,14 @@ async def test_ambiguities_alone_do_not_block_planning(settings: Settings) -> No
     assert response.route_legs
     assert response.itinerary_days
     assert response.requirements.travelers == 1
-    assert "Travelers not specified; assuming 1." in response.warnings
-    assert "Return deadline timezone assumed Asia/Kolkata." in response.warnings
+    assert "Travelers not specified; assuming 1." not in response.warnings
+    assert not any("timezone" in warning.casefold() for warning in response.warnings)
 
 
 @pytest.mark.asyncio
-async def test_missing_budget_and_deadline_warn_but_continue(settings: Settings) -> None:
+async def test_missing_optional_budget_and_deadline_continue_without_noise(
+    settings: Settings,
+) -> None:
     model = StaticIntentModel(
         TripRequirements(
             origin="Hyderabad",
@@ -181,8 +183,8 @@ async def test_missing_budget_and_deadline_warn_but_continue(settings: Settings)
     assert response.feasible is None
     assert response.route_legs
     assert response.itinerary_days
-    assert "Budget not specified; planning with budget unknown." in response.warnings
-    assert "Return deadline not specified; deadline validation skipped." in response.warnings
+    assert "Budget not specified; planning with budget unknown." not in response.warnings
+    assert "Return deadline not specified; deadline validation skipped." not in response.warnings
     assert (
         "Feasibility cannot be verified: transport times are unverified/stub." in response.warnings
     )
@@ -213,9 +215,10 @@ async def test_deterministic_validation_marks_impossible_plans_infeasible(
     assert response.feasible is False
     assert response.status == "completed"
     assert any(reason in warning for warning in response.warnings)
+    assert reason in response.warnings[0]
+    assert {link.mode for link in response.booking_links} >= {"train", "bus", "flight"}
     assert response.warnings[-4:] == [
-        "Alternative 1: Compare train/bus/flight options (not integrated yet; links to official "
-        "search pages are coming).",
+        "Alternative 1: Use the train, bus, or flight search links in booking_links.",
         "Alternative 2: Extend the trip dates or return deadline.",
         "Alternative 3: Drop a destination.",
         "Alternative 4: Increase the budget.",

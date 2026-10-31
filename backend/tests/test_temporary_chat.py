@@ -36,9 +36,12 @@ async def test_guest_temporary_chat_uses_redis_only_and_expires(
     assert first.status_code == 200, first.text
     body = first.json()
     assert body["trip"]["status"] == "completed"
-    assert body["assistant_message"].startswith(
-        "A source-labelled draft trip plan is ready."
-    )
+    assistant_summary = body["assistant_message"]
+    assert assistant_summary.startswith("Feasibility: unknown.")
+    assert "Main reason:" in assistant_summary
+    assert "Known cost is INR 10,500 against a budget of INR 15,000." in assistant_summary
+    assert 2 <= assistant_summary.count(". ") + assistant_summary.endswith(".") <= 3
+    assert len(assistant_summary) <= 320
     assert body["temp_token"]
     assert body["context_message_count"] == 2
     assert await db_session.scalar(select(func.count(Conversation.id))) == 0

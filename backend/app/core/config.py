@@ -66,6 +66,17 @@ class Settings(BaseSettings):
     )
     maps_http_timeout_seconds: float = Field(default=10.0, gt=0, le=60)
     geocode_cache_ttl_seconds: int = Field(default=2_592_000, ge=86_400)
+    tavily_enabled: bool = False
+    tavily_api_key: SecretStr | None = None
+    tavily_base_url: str = "https://api.tavily.com"
+    tavily_allowed_hosts: str = "api.tavily.com"
+    tavily_max_searches_per_trip: int = Field(default=2, ge=0, le=10)
+    tavily_cache_ttl_seconds: int = Field(default=604_800, ge=60)
+    tavily_timeout_seconds: float = Field(default=10.0, gt=0, le=60)
+    booking_allowed_hosts: str = (
+        "www.irctc.co.in,www.makemytrip.com,www.redbus.in,"
+        "www.google.com,www.booking.com"
+    )
     fuel_cost_per_km: Decimal = Field(default=Decimal("12.00"), gt=0)
     max_driving_hours_per_day: int = Field(default=10, ge=1, le=16)
     driving_latest_arrival_hour: int = Field(default=21, ge=7, le=23)
@@ -154,11 +165,41 @@ class Settings(BaseSettings):
             self.nominatim_base_url,
             allowed_hosts=allowed_hosts,
         )
+        tavily_allowed_hosts = parse_host_allowlist(self.tavily_allowed_hosts)
+        self.tavily_base_url = validate_external_base_url(
+            self.tavily_base_url,
+            allowed_hosts=tavily_allowed_hosts,
+        )
+        parse_host_allowlist(self.booking_allowed_hosts)
         return self
 
     @property
     def maps_host_allowlist(self) -> frozenset[str]:
         return parse_host_allowlist(self.maps_allowed_hosts)
+
+    @property
+    def tavily_host_allowlist(self) -> frozenset[str]:
+        return parse_host_allowlist(self.tavily_allowed_hosts)
+
+    @property
+    def booking_host_allowlist(self) -> frozenset[str]:
+        return parse_host_allowlist(self.booking_allowed_hosts)
+
+    @property
+    def tavily_configured(self) -> bool:
+        return bool(
+            self.tavily_enabled
+            and self.tavily_api_key is not None
+            and self.tavily_api_key.get_secret_value().strip()
+        )
+
+    def tavily_configuration_warnings(self) -> tuple[str, ...]:
+        if self.tavily_enabled and not self.tavily_configured:
+            return (
+                "TAVILY_ENABLED is true but TAVILY_API_KEY is empty; "
+                "attractions will use the labelled stub fallback.",
+            )
+        return ()
 
     @property
     def database_url(self) -> str:
@@ -238,6 +279,7 @@ class Settings(BaseSettings):
         optional_secrets = (
             self.secret_key,
             self.groq_api_key,
+            self.tavily_api_key,
             self.qdrant_api_key,
             self.smtp_password,
             self.langsmith_api_key,

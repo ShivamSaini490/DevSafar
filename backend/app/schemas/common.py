@@ -1,5 +1,5 @@
 
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal
 from typing import Literal
 
@@ -17,7 +17,7 @@ class PriceQuote(StrictSchema):
     amount: Decimal | None = Field(default=None, ge=0)
     currency: Currency = "INR"
     price_type: PriceType
-    source: str = Field(min_length=1, max_length=100)
+    source: str = Field(min_length=1, max_length=2048)
     fetched_at: datetime
 
     @model_validator(mode="after")
@@ -37,4 +37,14 @@ class DataSource(StrictSchema):
 
 class BookingLink(StrictSchema):
     provider: str = Field(min_length=1, max_length=100)
+    mode: Literal["train", "bus", "flight", "hotel"]
+    label: str = Field(min_length=1, max_length=200)
     url: HttpUrl
+    origin: str = Field(min_length=1, max_length=200)
+    destination: str = Field(min_length=1, max_length=200)
+    date: date
+    link_type: Literal["search_page"] = "search_page"
+    price_known: Literal[False] = False
+    note: Literal["Opening a provider page is not a confirmed booking."] = (
+        "Opening a provider page is not a confirmed booking."
+    )

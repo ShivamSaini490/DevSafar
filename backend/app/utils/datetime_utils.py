@@ -21,6 +21,19 @@ _DATETIME_WITHOUT_YEAR_FORMATS = tuple(
     for date_format in _DATE_WITHOUT_YEAR_FORMATS
     for time_format in ("%H:%M", "%I:%M %p", "%I %p")
 )
+_DAYPART_PATTERN = r"subah|morning|dopahar|afternoon|shaam|evening|raat|night"
+_TIME_WITH_PREFIX_RE = re.compile(
+    rf"(?i)\b(?P<daypart>{_DAYPART_PATTERN})\s+"
+    r"(?P<hour>\d{1,2})(?::(?P<minute>\d{2}))?\s*(?:baje|o'clock)?\b"
+)
+_TIME_WITH_SUFFIX_RE = re.compile(
+    rf"(?i)\b(?P<hour>\d{{1,2}})(?::(?P<minute>\d{{2}}))?\s*baje"
+    rf"(?:\s*(?P<daypart>{_DAYPART_PATTERN}))?\b"
+)
+_TIME_WITH_MERIDIEM_RE = re.compile(
+    r"(?i)\b(?P<hour>\d{1,2})(?::(?P<minute>\d{2}))?\s*(?P<daypart>am|pm)\b"
+)
+_TIME_24_HOUR_RE = re.compile(r"\b(?P<hour>[01]?\d|2[0-3]):(?P<minute>[0-5]\d)\b")
 
 
 def india_today() -> date:
@@ -110,6 +123,42 @@ def parse_lenient_india_datetime(
         candidate_date = _roll_forward_year(candidate.date(), not_before=threshold)
         return as_india_time(candidate.replace(year=candidate_date.year))
     raise ValueError("Unsupported datetime format")
+
+
+def extract_explicit_time(value: str) -> time | None:
+    """Extract a user-written clock time, including common Hinglish dayparts."""
+
+    matches = [
+        match
+        for pattern in (
+            _TIME_WITH_PREFIX_RE,
+            _TIME_WITH_SUFFIX_RE,
+            _TIME_WITH_MERIDIEM_RE,
+            _TIME_24_HOUR_RE,
+        )
+        for match in pattern.finditer(value)
+    ]
+    if not matches:
+        return None
+    match = max(matches, key=lambda item: item.start())
+    hour = int(match.group("hour"))
+    minute = int(match.groupdict().get("minute") or 0)
+    daypart = (match.groupdict().get("daypart") or "").casefold()
+    if hour > 23 or minute > 59:
+        return None
+    if daypart in {"subah", "morning", "am"}:
+        hour = 0 if hour == 12 else hour
+    elif daypart in {"dopahar", "afternoon", "shaam", "evening", "pm"}:
+        if hour < 12:
+            hour += 12
+    elif daypart in {"raat", "night"}:
+        if hour == 12:
+            hour = 0
+        elif hour < 12:
+            hour += 12
+    if hour > 23:
+        return None
+    return time(hour=hour, minute=minute)
 
 
 def as_india_time(value: datetime) -> datetime:

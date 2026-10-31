@@ -31,7 +31,11 @@ def build_research_node(
             "destination_knowledge": [
                 "Stub destination knowledge only; RAG is not connected."
             ],
-            "provider_sources": provider_sources(providers, fetched_at),
+            "provider_sources": provider_sources(
+                providers,
+                fetched_at,
+                attractions=attractions,
+            ),
         }
 
     return research_node

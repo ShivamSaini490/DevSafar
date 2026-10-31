@@ -145,6 +145,9 @@ class StubPlacesProvider:
                     fetched_at=self.fetched_at,
                 ),
                 opening_hours=None,
+                source_url=None,
+                source_domain=None,
+                fetched_at=self.fetched_at,
             )
             for destination in requirements.destinations
             if destination != requirements.origin
@@ -158,6 +161,7 @@ class ProviderBundle:
     hotels: HotelProvider
     places: PlacesProvider
     maps_source_name: str
+    places_source_name: str
 
     @classmethod
     def stubs(cls, fetched_at: datetime) -> "ProviderBundle":
@@ -167,6 +171,7 @@ class ProviderBundle:
             hotels=StubHotelProvider(fetched_at),
             places=StubPlacesProvider(fetched_at),
             maps_source_name="stub_maps",
+            places_source_name="stub_places",
         )
 
     def with_maps(self, maps: MapsProvider, *, source_name: str) -> "ProviderBundle":
@@ -176,10 +181,28 @@ class ProviderBundle:
             hotels=self.hotels,
             places=self.places,
             maps_source_name=source_name,
+            places_source_name=self.places_source_name,
+        )
+
+    def with_places(
+        self, places: PlacesProvider, *, source_name: str
+    ) -> "ProviderBundle":
+        return ProviderBundle(
+            maps=self.maps,
+            transport=self.transport,
+            hotels=self.hotels,
+            places=places,
+            maps_source_name=self.maps_source_name,
+            places_source_name=source_name,
         )
 
 
-def provider_sources(bundle: ProviderBundle, fetched_at: datetime) -> list[DataSource]:
+def provider_sources(
+    bundle: ProviderBundle,
+    fetched_at: datetime,
+    *,
+    attractions: list[AttractionOption] | None = None,
+) -> list[DataSource]:
     maps_price_type: PriceType = "estimate" if bundle.maps_source_name == "osrm" else "unknown"
     transport_source: tuple[str, PriceType] = (
         ("osrm+fuel_formula", "estimate")
@@ -190,7 +213,18 @@ def provider_sources(bundle: ProviderBundle, fetched_at: datetime) -> list[DataS
         (bundle.maps_source_name, maps_price_type),
         transport_source,
         ("stub_hotels", "estimate"),
-        ("stub_places", "unknown"),
+        (
+            bundle.places_source_name,
+            (
+                "estimate"
+                if bundle.places_source_name == "tavily"
+                and any(
+                    item.entry_fee.price_type == "estimate"
+                    for item in attractions or []
+                )
+                else "unknown"
+            ),
+        ),
     )
     return [
         DataSource(name=name, price_type=price_type, fetched_at=fetched_at)

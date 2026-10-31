@@ -1,6 +1,7 @@
 from collections import defaultdict
 from datetime import date, datetime, time, timedelta
 
+from app.schemas.attraction import AttractionOption
 from app.schemas.itinerary import ItineraryActivity, ItineraryDay
 from app.schemas.transport import RouteLeg
 from app.schemas.trip import TripRequirements
@@ -13,6 +14,7 @@ class ItineraryService:
         requirements: TripRequirements,
         route_legs: list[RouteLeg],
         *,
+        attractions: list[AttractionOption] | None = None,
         min_stay_hours_per_destination: int = 6,
         now: datetime | None = None,
     ) -> list[ItineraryDay]:
@@ -20,6 +22,11 @@ class ItineraryService:
             return []
 
         current_time = as_india_time(now or india_now())
+        attraction_names: dict[str, list[str]] = defaultdict(list)
+        for attraction in attractions or []:
+            names = attraction_names[attraction.destination]
+            if attraction.name not in names and len(names) < 3:
+                names.append(attraction.name)
         activities_by_date: dict[date, list[ItineraryActivity]] = defaultdict(list)
         end_location_events: dict[date, list[tuple[datetime, str]]] = defaultdict(list)
         for index, leg in enumerate(route_legs):
@@ -83,14 +90,30 @@ class ItineraryService:
                 hours=min_stay_hours_per_destination
             )
             stay_end = max(minimum_stay_end, next_departure or minimum_stay_end)
+            suggestions = attraction_names.get(leg.destination, [])
             activities_by_date[arrival_at.date()].append(
                 ItineraryActivity(
                     title=f"Stay in {leg.destination}",
                     location=leg.destination,
                     starts_at=arrival_at,
                     ends_at=stay_end,
-                    notes=(
-                        f"Minimum destination stay: {min_stay_hours_per_destination} hours."
+                    notes=" ".join(
+                        filter(
+                            None,
+                            [
+                                (
+                                    f"Minimum destination stay: "
+                                    f"{min_stay_hours_per_destination} hours."
+                                ),
+                                (
+                                    "Suggested attractions (unscheduled): "
+                                    + ", ".join(suggestions)
+                                    + "."
+                                    if suggestions
+                                    else ""
+                                ),
+                            ],
+                        )
                     ),
                 )
             )
@@ -99,7 +122,12 @@ class ItineraryService:
             (leg.arrival_at.date() for leg in route_legs if leg.arrival_at is not None),
             default=requirements.end_date,
         )
-        final_date = max(requirements.end_date, last_arrival_date)
+        returned_home_at = ItineraryService.planned_return_at(requirements, route_legs)
+        final_date = (
+            returned_home_at.date()
+            if returned_home_at is not None
+            else max(requirements.end_date, last_arrival_date)
+        )
         latest_activity_date = max(
             (
                 activity.ends_at.date()
@@ -109,7 +137,8 @@ class ItineraryService:
             ),
             default=final_date,
         )
-        final_date = max(final_date, latest_activity_date)
+        if returned_home_at is None:
+            final_date = max(final_date, latest_activity_date)
         current_destination = requirements.origin or "Unknown"
         days: list[ItineraryDay] = []
         day_date = requirements.start_date

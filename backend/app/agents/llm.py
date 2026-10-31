@@ -1,7 +1,7 @@
 import json
 from collections.abc import Callable, Mapping
 from contextlib import suppress
-from datetime import date, datetime
+from datetime import date, datetime, time
 from decimal import Decimal, InvalidOperation
 from typing import Any, Protocol, cast
 
@@ -17,10 +17,13 @@ from app.schemas.trip import TripRequirements, TripResponse
 from app.utils.datetime_utils import (
     INDIA_TIME_ZONE,
     as_india_time,
+    extract_explicit_time,
     india_today,
     parse_lenient_date,
     parse_lenient_india_datetime,
 )
+
+RETURN_TIME_ASSUMPTION = "Return time not specified; assuming 23:59 Asia/Kolkata."
 
 _STRICT_JSON_SCHEMA_MODELS = frozenset(
     {
@@ -211,6 +214,7 @@ def _normalize_requirement_payload(
     result: Any,
     *,
     current_date: date,
+    user_prompt: str,
 ) -> Any:
     if not isinstance(result, Mapping):
         return result
@@ -226,6 +230,9 @@ def _normalize_requirement_payload(
             else destination
             for destination in destinations
         ]
+    # Provider ambiguities are diagnostic hints, not user-facing warnings. Critical
+    # clarification is derived from normalized required fields below the model boundary.
+    payload["ambiguities"] = []
     ambiguities = payload["ambiguities"]
     if payload.get("travelers") is None:
         payload["travelers"] = 1
@@ -255,36 +262,63 @@ def _normalize_requirement_payload(
             end_date = None
 
     return_deadline = payload.get("return_deadline")
+    parsed_deadline: datetime | None = None
     if isinstance(return_deadline, str):
-        normalized_deadline = return_deadline.upper()
-        has_explicit_timezone = (
-            "IST" in normalized_deadline
-            or normalized_deadline.endswith("Z")
-            or "+05:30" in normalized_deadline
-        )
         with suppress(ValueError):
-            payload["return_deadline"] = parse_lenient_india_datetime(
+            parsed_deadline = parse_lenient_india_datetime(
                 return_deadline,
                 current_date=current_date,
                 not_before=end_date if isinstance(end_date, date) else None,
             )
-            if not has_explicit_timezone and isinstance(ambiguities, list):
-                ambiguities.append("Return deadline timezone assumed Asia/Kolkata.")
+        if parsed_deadline is None:
+            with suppress(ValueError):
+                deadline_date = parse_lenient_date(
+                    return_deadline,
+                    current_date=current_date,
+                    not_before=end_date if isinstance(end_date, date) else None,
+                )
+                parsed_deadline = datetime.combine(
+                    deadline_date,
+                    time.min,
+                    tzinfo=INDIA_TIME_ZONE,
+                )
     elif isinstance(return_deadline, datetime):
-        payload["return_deadline"] = as_india_time(return_deadline)
-        if return_deadline.tzinfo is None and isinstance(ambiguities, list):
-            ambiguities.append("Return deadline timezone assumed Asia/Kolkata.")
+        parsed_deadline = as_india_time(return_deadline)
+
+    if parsed_deadline is not None:
+        explicit_time = extract_explicit_time(user_prompt)
+        if explicit_time is None:
+            parsed_deadline = parsed_deadline.replace(hour=23, minute=59, second=0, microsecond=0)
+            if isinstance(ambiguities, list):
+                ambiguities.append(RETURN_TIME_ASSUMPTION)
+        else:
+            parsed_deadline = parsed_deadline.replace(
+                hour=explicit_time.hour,
+                minute=explicit_time.minute,
+                second=0,
+                microsecond=0,
+            )
+        payload["return_deadline"] = parsed_deadline
 
     payload["budget"] = _normalize_budget(payload.get("budget"))
     return payload
 
 
-def _parse_requirements(result: Any, *, current_date: date) -> TripRequirements:
+def _parse_requirements(
+    result: Any,
+    *,
+    current_date: date,
+    user_prompt: str,
+) -> TripRequirements:
     if isinstance(result, TripRequirements):
         return result
     if isinstance(result, str):
         result = json.loads(result)
-    normalized = _normalize_requirement_payload(result, current_date=current_date)
+    normalized = _normalize_requirement_payload(
+        result,
+        current_date=current_date,
+        user_prompt=user_prompt,
+    )
     return TripRequirements.model_validate(normalized)
 
 
@@ -386,7 +420,11 @@ class GroqIntentModel:
                     user_prompt=user_prompt,
                 ) from exc
             try:
-                return _parse_requirements(result, current_date=current_date)
+                return _parse_requirements(
+                    result,
+                    current_date=current_date,
+                    user_prompt=user_prompt,
+                )
             except json.JSONDecodeError as exc:
                 if attempt == 0:
                     continue

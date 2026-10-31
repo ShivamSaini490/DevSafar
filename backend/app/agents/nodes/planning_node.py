@@ -75,6 +75,7 @@ def build_planning_node(
             "itinerary": ItineraryService.build(
                 requirements,
                 route_legs,
+                attractions=state["attractions"],
                 min_stay_hours_per_destination=settings.min_stay_hours_per_destination,
                 now=planning_now,
             ),
@@ -102,8 +103,8 @@ def build_planning_node(
                         ),
                         *(
                             [
-                                "Based on road travel estimates only; trains, buses and "
-                                "flights are not compared yet."
+                                "Road estimates drive feasibility; official train, bus, and "
+                                "flight search pages are included as alternatives."
                             ]
                             if settings.maps_provider == "osm"
                             else []

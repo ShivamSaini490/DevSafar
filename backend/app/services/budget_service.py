@@ -1,3 +1,4 @@
+from collections.abc import Sequence
 from datetime import datetime
 from decimal import ROUND_HALF_UP, Decimal
 
@@ -13,7 +14,7 @@ from app.utils.currency_utils import all_amounts_known, sum_known_amounts
 def _priced_category(
     *,
     name: str,
-    amounts: list[Decimal | None],
+    amounts: Sequence[Decimal | None],
     fetched_at: datetime,
     source: str = "stub",
 ) -> BudgetCategory:
@@ -81,13 +82,31 @@ class BudgetService:
             ),
         ]
         if attractions:
-            categories.append(
-                _priced_category(
-                    name="Attractions",
-                    amounts=attraction_prices,
-                    fetched_at=fetched_at,
+            known_attraction_prices = [
+                amount for amount in attraction_prices if amount is not None
+            ]
+            if known_attraction_prices:
+                categories.append(
+                    _priced_category(
+                        name="Attractions",
+                        amounts=known_attraction_prices,
+                        fetched_at=fetched_at,
+                        source="provider_sources",
+                    )
                 )
-            )
+            if len(known_attraction_prices) != len(attraction_prices):
+                categories.append(
+                    _priced_category(
+                        name=(
+                            "Attractions"
+                            if not known_attraction_prices
+                            else "Attractions (unpriced entries)"
+                        ),
+                        amounts=[None],
+                        fetched_at=fetched_at,
+                        source="provider_sources",
+                    )
+                )
 
         if food_per_day_per_traveler is not None:
             trip_days = (

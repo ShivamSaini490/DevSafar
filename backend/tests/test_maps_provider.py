@@ -249,6 +249,7 @@ async def _run_road_plan(
     now: datetime | None = None,
     min_stay_hours: int = 6,
     destination: str = "Puducherry",
+    end_date: date = date(2026, 10, 30),
 ) -> TripResponse:
     osm_settings = settings.model_copy(
         update={
@@ -260,7 +261,7 @@ async def _run_road_plan(
         origin="Hyderabad",
         destinations=[destination],
         start_date=date(2026, 10, 30),
-        end_date=date(2026, 10, 30),
+        end_date=end_date,
         budget=Decimal("1000000"),
         return_deadline=deadline,
     )
@@ -337,6 +338,32 @@ async def test_vijayawada_round_trip_stays_six_hours_and_returns_same_day(
 
 
 @pytest.mark.asyncio
+async def test_itinerary_stops_after_returning_home_and_days_stay_continuous(
+    settings: Settings,
+) -> None:
+    response = await _run_road_plan(
+        settings,
+        distance_km=Decimal("100"),
+        duration_minutes=120,
+        deadline=datetime(2026, 11, 2, 21, tzinfo=INDIA_TIME_ZONE),
+        end_date=date(2026, 11, 2),
+    )
+
+    returned_at = response.route_legs[-1].arrival_at
+    assert returned_at is not None
+    assert response.itinerary_days[-1].date == returned_at.date()
+    assert [day.day for day in response.itinerary_days] == list(
+        range(1, len(response.itinerary_days) + 1)
+    )
+    assert not any(
+        activity.title.startswith("Flexible/rest day")
+        for day in response.itinerary_days
+        if day.date > returned_at.date()
+        for activity in day.activities
+    )
+
+
+@pytest.mark.asyncio
 async def test_1100_km_leg_splits_within_daily_and_clock_limits(settings: Settings) -> None:
     response = await _run_road_plan(
         settings,
@@ -385,15 +412,16 @@ async def test_long_road_route_uses_multi_day_schedule_and_misses_deadline(
     assert response.route_legs[-1].arrival_at > response.requirements.return_deadline
     assert any("misses the required return deadline" in warning for warning in response.warnings)
     assert any("overnight rest stop" in warning for warning in response.warnings)
+    assert {link.mode for link in response.booking_links} >= {"train", "bus", "flight"}
     assert response.warnings[-4:] == [
-        "Alternative 1: Compare train/bus/flight options (not integrated yet; links to official "
-        "search pages are coming).",
+        "Alternative 1: Use the train, bus, or flight search links in booking_links.",
         "Alternative 2: Extend the trip dates or return deadline.",
         "Alternative 3: Drop a destination.",
         "Alternative 4: Increase the budget.",
     ]
     assert (
-        "Based on road travel estimates only; trains, buses and flights are not compared yet."
+        "Road estimates drive feasibility; official train, bus, and flight search pages are "
+        "included as alternatives."
         in response.warnings
     )
     assert (

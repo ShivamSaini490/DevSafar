@@ -18,6 +18,7 @@ from app.core.logging import configure_logging
 from app.db.session import create_db_engine, create_redis_client, create_session_factory
 from app.integrations.base import ProviderBundle
 from app.integrations.maps_provider import OsmMapsProvider
+from app.integrations.tavily_provider import TavilyAttractionsProvider
 from app.tasks.cleanup_tasks import run_cleanup_loop
 
 logger = logging.getLogger(__name__)
@@ -64,26 +65,57 @@ def _lifespan(settings: Settings) -> Callable[[FastAPI], AbstractAsyncContextMan
         session_factory = create_session_factory(engine)
         app.state.db_session_factory = session_factory
         app.state.redis = redis
-        maps_http_client: httpx.AsyncClient | None = None
+        provider_http_client: httpx.AsyncClient | None = None
         if not hasattr(app.state, "trip_planner"):
+            if settings.maps_provider == "osm" or settings.tavily_configured:
+                provider_http_client = httpx.AsyncClient()
+
             if settings.maps_provider == "osm":
-                http_client = httpx.AsyncClient()
-                maps_http_client = http_client
+                assert provider_http_client is not None
                 osm_maps_provider = OsmMapsProvider(
                     settings,
                     redis,
-                    client=http_client,
+                    client=provider_http_client,
                 )
 
                 def provider_factory(fetched_at: datetime) -> ProviderBundle:
-                    return ProviderBundle.stubs(fetched_at).with_maps(
+                    bundle = ProviderBundle.stubs(fetched_at).with_maps(
                         osm_maps_provider,
                         source_name="osrm",
                     )
+                    if settings.tavily_configured:
+                        bundle = bundle.with_places(
+                            TavilyAttractionsProvider(
+                                settings,
+                                redis,
+                                fetched_at=fetched_at,
+                                client=provider_http_client,
+                            ),
+                            source_name="tavily",
+                        )
+                    return bundle
 
                 app.state.trip_planner = LangGraphTripPlanner(
                     settings,
                     provider_factory=provider_factory,
+                )
+            elif settings.tavily_configured:
+                assert provider_http_client is not None
+
+                def tavily_provider_factory(fetched_at: datetime) -> ProviderBundle:
+                    return ProviderBundle.stubs(fetched_at).with_places(
+                        TavilyAttractionsProvider(
+                            settings,
+                            redis,
+                            fetched_at=fetched_at,
+                            client=provider_http_client,
+                        ),
+                        source_name="tavily",
+                    )
+
+                app.state.trip_planner = LangGraphTripPlanner(
+                    settings,
+                    provider_factory=tavily_provider_factory,
                 )
             else:
                 app.state.trip_planner = LangGraphTripPlanner(settings)
@@ -101,8 +133,8 @@ def _lifespan(settings: Settings) -> Callable[[FastAPI], AbstractAsyncContextMan
                 cleanup_task.cancel()
                 with suppress(asyncio.CancelledError):
                     await cleanup_task
-            if maps_http_client is not None:
-                await maps_http_client.aclose()
+            if provider_http_client is not None:
+                await provider_http_client.aclose()
             await redis.aclose()
             await engine.dispose()
 
@@ -119,6 +151,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         )
     for smtp_warning in app_settings.smtp_configuration_warnings():
         logger.warning(smtp_warning)
+    for tavily_warning in app_settings.tavily_configuration_warnings():
+        logger.warning(tavily_warning)
 
     application = FastAPI(
         title=app_settings.app_name,

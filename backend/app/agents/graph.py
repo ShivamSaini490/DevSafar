@@ -11,7 +11,7 @@ from app.agents.llm import GroqIntentModel, IntentModel, IntentModelFailure
 from app.agents.nodes.intent_node import build_intent_node
 from app.agents.nodes.planning_node import build_planning_node
 from app.agents.nodes.research_node import build_research_node
-from app.agents.nodes.response_node import response_node
+from app.agents.nodes.response_node import build_response_node
 from app.agents.nodes.validation_node import validation_node
 from app.agents.state import TravelState
 from app.core.config import Settings
@@ -61,7 +61,7 @@ class LangGraphTripPlanner:
             build_planning_node(settings, now_provider=now_provider),
         )
         workflow.add_node("validation", validation_node)
-        workflow.add_node("response", response_node)
+        workflow.add_node("response", build_response_node(settings))
         workflow.add_edge(START, "intent")
         workflow.add_conditional_edges("intent", after_intent, {"research": "research", "end": END})
         workflow.add_edge("research", "planning")
