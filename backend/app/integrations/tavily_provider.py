@@ -1,4 +1,5 @@
 import asyncio
+import difflib
 import hashlib
 import html
 import logging
@@ -16,8 +17,9 @@ import httpx
 from pydantic import BaseModel, ConfigDict, HttpUrl, TypeAdapter, ValidationError
 from redis.asyncio import Redis
 
-from app.agents.llm import AttractionExtractor
+from app.agents.llm import AttractionExtractionFailure, AttractionExtractor
 from app.core.config import Settings
+from app.core.logging import current_request_id
 from app.schemas.attraction import AttractionCandidate, AttractionOption
 from app.schemas.common import PriceQuote
 from app.schemas.trip import TripRequirements
@@ -94,6 +96,12 @@ class _SourceSnippet:
     content: str
 
 
+@dataclass(slots=True)
+class _ExternalCallCounts:
+    tavily_searches: int = 0
+    groq_calls: int = 0
+
+
 _ATTRACTION_LIST = TypeAdapter(list[AttractionOption])
 _HTTP_URL = TypeAdapter(HttpUrl)
 
@@ -123,72 +131,98 @@ class TavilyAttractionsProvider:
         )
 
     async def attractions(self, requirements: TripRequirements) -> list[AttractionOption]:
-        destinations = list(
-            dict.fromkeys(
-                destination
-                for destination in requirements.destinations
-                if destination != requirements.origin
-            )
-        )
-        if not destinations:
-            return []
-        if not self.settings.tavily_configured:
-            return [self._fallback(destination) for destination in destinations]
-
-        searches_used = 0
-        attractions: list[AttractionOption] = []
-        for destination in destinations:
-            cached = await self._read_cache(destination)
-            if cached is not None:
-                attractions.extend(cached)
-                continue
-            if searches_used >= self.settings.tavily_max_searches_per_trip:
-                attractions.append(self._fallback(destination))
-                continue
-
-            searches_used += 1
-            payload = await self._search(destination)
-            if payload is None:
-                attractions.append(self._fallback(destination))
-                continue
-            snippets = self._eligible_snippets(payload)
-            if not snippets:
-                attractions.append(self._fallback(destination))
-                continue
-            try:
-                candidates = await self.extractor.extract_attractions(
-                    city=destination,
-                    snippets=[snippet.content for snippet in snippets],
+        counts = _ExternalCallCounts()
+        try:
+            destinations = list(
+                dict.fromkeys(
+                    destination
+                    for destination in requirements.destinations
+                    if destination != requirements.origin
                 )
-            except Exception as exc:
-                logger.warning(
-                    "Groq attraction extraction failed; using stub fallback",
-                    extra={
-                        "error_type": getattr(exc, "error_type", type(exc).__name__),
-                        "http_status": getattr(exc, "http_status", None),
-                    },
-                )
-                attractions.append(self._fallback(destination))
-                continue
-            grounded = self._ground_candidates(
-                destination,
-                candidates,
-                snippets,
             )
-            if not grounded:
-                attractions.append(self._fallback(destination))
-                continue
-            attractions.extend(grounded)
-            await self._write_cache(destination, grounded)
-        return attractions
+            if not destinations:
+                return []
+            if not self.settings.tavily_configured:
+                return [self._fallback(destination) for destination in destinations]
 
-    async def _search(self, city: str) -> _TavilyResponse | None:
+            searches_used = 0
+            attractions: list[AttractionOption] = []
+            for destination in destinations:
+                cached = await self._read_cache(destination)
+                if cached is not None:
+                    attractions.extend(cached)
+                    continue
+                if await self._negative_cache_hit(destination):
+                    attractions.append(self._fallback(destination))
+                    continue
+                if searches_used >= self.settings.tavily_max_searches_per_trip:
+                    attractions.append(self._fallback(destination))
+                    continue
+
+                searches_used += 1
+                payload, search_calls = await self._search(destination)
+                counts.tavily_searches += search_calls
+                if payload is None:
+                    await self._write_negative_cache(destination)
+                    attractions.append(self._fallback(destination))
+                    continue
+                snippets = self._prepare_snippets(payload)
+                if not snippets:
+                    await self._write_negative_cache(destination)
+                    attractions.append(self._fallback(destination))
+                    continue
+                try:
+                    extraction = await self.extractor.extract_attractions(
+                        city=destination,
+                        snippets=[snippet.content for snippet in snippets],
+                    )
+                    counts.groq_calls += extraction.external_calls
+                except AttractionExtractionFailure as exc:
+                    counts.groq_calls += exc.external_calls
+                    await self._write_negative_cache(destination)
+                    attractions.append(self._fallback(destination))
+                    continue
+                except Exception as exc:
+                    counts.groq_calls += int(getattr(exc, "external_calls", 0))
+                    logger.warning(
+                        "Unexpected attraction extractor failure; using stub fallback",
+                        extra={
+                            "request_id": current_request_id(),
+                            "error_type": type(exc).__name__,
+                        },
+                    )
+                    await self._write_negative_cache(destination)
+                    attractions.append(self._fallback(destination))
+                    continue
+                grounded = self._ground_candidates(
+                    destination,
+                    extraction.candidates,
+                    snippets,
+                )
+                if not grounded:
+                    await self._write_negative_cache(destination)
+                    attractions.append(self._fallback(destination))
+                    continue
+                attractions.extend(grounded)
+                await self._write_cache(destination, grounded)
+            return attractions
+        finally:
+            logger.info(
+                "Attraction external call counts",
+                extra={
+                    "request_id": current_request_id(),
+                    "groq_calls": counts.groq_calls,
+                    "tavily_searches": counts.tavily_searches,
+                },
+            )
+
+    async def _search(self, city: str) -> tuple[_TavilyResponse | None, int]:
         api_key = self.settings.tavily_api_key
         if api_key is None:
-            return None
+            return None, 0
         safe_city = self._city_for_query(city)
         if not safe_city:
-            return None
+            return None, 0
         headers = {
             "Authorization": f"Bearer {api_key.get_secret_value()}",
             "Content-Type": "application/json",
@@ -203,14 +237,16 @@ class TavilyAttractionsProvider:
             "include_images": False,
             "exclude_domains": sorted(self.settings.tavily_excluded_domain_set),
         }
+        calls = 0
         for attempt in range(MAX_RETRIES + 1):
             try:
+                calls += 1
                 response = await self._send(headers=headers, body=body)
                 if response.status_code in {432, 433}:
                     self._log_failure("TavilyCreditsExhausted", response.status_code)
-                    return None
+                    return None, calls
                 response.raise_for_status()
-                return _TavilyResponse.model_validate(response.json())
+                return _TavilyResponse.model_validate(response.json()), calls
             except Exception as exc:
                 status = getattr(getattr(exc, "response", None), "status_code", None)
                 retryable = not isinstance(exc, httpx.HTTPStatusError) or (
@@ -218,13 +254,11 @@ class TavilyAttractionsProvider:
                 )
                 if attempt >= MAX_RETRIES or not retryable:
                     self._log_failure(type(exc).__name__, status)
-                    return None
+                    return None, calls
                 await self._sleep(RETRY_BACKOFF_SECONDS * (2**attempt))
-        return None
+        return None, calls
 
-    async def _send(
-        self, *, headers: dict[str, str], body: dict[str, Any]
-    ) -> httpx.Response:
+    async def _send(self, *, headers: dict[str, str], body: dict[str, Any]) -> httpx.Response:
         url = f"{self._base_url}/search"
         if self.client is not None:
             return await self.client.post(
@@ -264,6 +298,56 @@ class TavilyAttractionsProvider:
             )
         return snippets
 
+    def _prepare_snippets(self, payload: _TavilyResponse) -> list[_SourceSnippet]:
+        eligible = self._eligible_snippets(payload)
+        selected: list[_SourceSnippet] = []
+        fingerprints: list[str] = []
+        near_empty_count = 0
+        duplicate_count = 0
+        truncated_count = 0
+        for snippet in eligible:
+            normalized_content = " ".join(snippet.content.split())
+            if len(normalized_content) < 40:
+                near_empty_count += 1
+                continue
+            fingerprint = self._normalize_for_grounding(normalized_content)
+            if any(
+                fingerprint == existing
+                or difflib.SequenceMatcher(None, fingerprint, existing).ratio() >= 0.9
+                for existing in fingerprints
+            ):
+                duplicate_count += 1
+                continue
+            if len(normalized_content) > self.settings.attraction_snippet_max_chars:
+                normalized_content = normalized_content[
+                    : self.settings.attraction_snippet_max_chars
+                ].rstrip()
+                truncated_count += 1
+            selected.append(
+                _SourceSnippet(
+                    title=snippet.title,
+                    url=snippet.url,
+                    domain=snippet.domain,
+                    content=normalized_content,
+                )
+            )
+            fingerprints.append(fingerprint)
+            if len(selected) >= self.settings.tavily_snippets_for_extraction:
+                break
+        logger.info(
+            "Prepared Tavily snippets for attraction extraction",
+            extra={
+                "request_id": current_request_id(),
+                "result_count": len(payload.results),
+                "eligible_count": len(eligible),
+                "selected_count": len(selected),
+                "near_empty_count": near_empty_count,
+                "duplicate_count": duplicate_count,
+                "truncated_count": truncated_count,
+            },
+        )
+        return selected
+
     def _ground_candidates(
         self,
         destination: str,
@@ -272,9 +356,7 @@ class TavilyAttractionsProvider:
     ) -> list[AttractionOption]:
         items: list[AttractionOption] = []
         seen_names: set[str] = set()
-        title_names = {
-            self._normalize_for_grounding(snippet.title) for snippet in snippets
-        }
+        title_names = {self._normalize_for_grounding(snippet.title) for snippet in snippets}
         for candidate in candidates:
             name = self._clean_plain_text(candidate.name, limit=120)
             normalized_name = self._normalize_for_grounding(name)
@@ -303,8 +385,7 @@ class TavilyAttractionsProvider:
                 if (
                     other.url == snippet.url
                     or other.url in extra_urls
-                    or normalized_name
-                    not in self._normalize_for_grounding(other.content)
+                    or normalized_name not in self._normalize_for_grounding(other.content)
                 ):
                     continue
                 extra_urls.append(other.url)
@@ -355,10 +436,7 @@ class TavilyAttractionsProvider:
                 continue
             if normalized_name not in cls._normalize_for_grounding(evidence_quote):
                 continue
-            if any(
-                phrase in evidence_quote.casefold()
-                for phrase in _INSTRUCTION_PHRASES
-            ):
+            if any(phrase in evidence_quote.casefold() for phrase in _INSTRUCTION_PHRASES):
                 continue
             return snippet, evidence_quote.strip()
         return None
@@ -394,12 +472,38 @@ class TavilyAttractionsProvider:
                 "Tavily attraction cache write failed",
                 extra={"error_type": type(exc).__name__},
             )
+        finally:
+            with suppress(Exception):
+                await self.redis.delete(self._negative_cache_key(city))
+
+    async def _negative_cache_hit(self, city: str) -> bool:
+        try:
+            return bool(await self.redis.get(self._negative_cache_key(city)))
+        except Exception as exc:
+            logger.warning(
+                "Tavily attraction negative cache read failed",
+                extra={"error_type": type(exc).__name__},
+            )
+            return False
+
+    async def _write_negative_cache(self, city: str) -> None:
+        try:
+            await self.redis.set(
+                self._negative_cache_key(city),
+                b"1",
+                ex=self.settings.tavily_negative_cache_ttl_seconds,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Tavily attraction negative cache write failed",
+                extra={"error_type": type(exc).__name__},
+            )
 
     def _fallback(self, destination: str) -> AttractionOption:
         return AttractionOption(
             destination=destination,
             name=f"Stub attraction in {destination}",
-            description="Placeholder only; Tavily attraction research is unavailable.",
+            description="Attraction research unavailable for this destination right now.",
             entry_fee=PriceQuote(
                 amount=None,
                 price_type="unknown",
@@ -432,9 +536,7 @@ class TavilyAttractionsProvider:
     @staticmethod
     def _normalize_for_grounding(value: str) -> str:
         return "".join(
-            character
-            for character in html.unescape(value).casefold()
-            if character.isalnum()
+            character for character in html.unescape(value).casefold() if character.isalnum()
         )
 
     @staticmethod
@@ -468,9 +570,7 @@ class TavilyAttractionsProvider:
     def _parse_opening_hours(text: str) -> str | None:
         range_match = _OPEN_FROM_PATTERN.search(text)
         if range_match is not None:
-            return " - ".join(
-                " ".join(value.split()) for value in range_match.groups()
-            )
+            return " - ".join(" ".join(value.split()) for value in range_match.groups())
         at_match = _OPENS_AT_PATTERN.search(text)
         if at_match is not None:
             return f"Opens at {' '.join(at_match.group(1).split())}"
@@ -487,3 +587,8 @@ class TavilyAttractionsProvider:
     def _cache_key(city: str) -> str:
         digest = hashlib.sha256(city.casefold().strip().encode("utf-8")).hexdigest()
         return f"devsafar:tavily:attractions:v2:{digest}"
+
+    @staticmethod
+    def _negative_cache_key(city: str) -> str:
+        digest = hashlib.sha256(city.casefold().strip().encode("utf-8")).hexdigest()
+        return f"devsafar:tavily:attractions:v2:negative:{digest}"

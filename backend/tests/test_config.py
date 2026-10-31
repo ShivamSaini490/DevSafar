@@ -10,8 +10,13 @@ def test_tavily_defaults_are_disabled_and_bounded() -> None:
     assert settings.tavily_enabled is False
     assert settings.tavily_max_searches_per_trip == 2
     assert settings.tavily_cache_ttl_seconds == 604_800
+    assert settings.tavily_negative_cache_ttl_seconds == 120
     assert settings.tavily_timeout_seconds == 10
+    assert settings.tavily_snippets_for_extraction == 4
+    assert settings.attraction_snippet_max_chars == 700
     assert settings.attractions_per_destination == 6
+    assert settings.groq_max_retry_wait_seconds == 8
+    assert settings.groq_extraction_model_name == settings.groq_model
     assert settings.tavily_excluded_domain_set == {
         "youtube.com",
         "youtu.be",
@@ -66,3 +71,14 @@ def test_tavily_without_groq_has_grounding_warning() -> None:
         "Tavily is configured but GROQ_API_KEY is empty; grounded attraction "
         "extraction will use the labelled stub fallback.",
     )
+
+
+def test_groq_extraction_model_override_is_normalized() -> None:
+    settings = Settings(
+        _env_file=None,
+        environment="test",
+        secret_key="test-secret",
+        groq_extraction_model="  llama-3.1-8b-instant  ",
+    )
+
+    assert settings.groq_extraction_model_name == "llama-3.1-8b-instant"

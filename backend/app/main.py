@@ -15,7 +15,7 @@ from app.agents.llm import GroqAttractionExtractor
 from app.api.router import api_router
 from app.core.config import Settings, get_settings
 from app.core.exceptions import handle_unexpected_exception, register_exception_handlers
-from app.core.logging import configure_logging
+from app.core.logging import bind_request_id, configure_logging, reset_request_id
 from app.db.session import create_db_engine, create_redis_client, create_session_factory
 from app.integrations.base import ProviderBundle
 from app.integrations.maps_provider import OsmMapsProvider
@@ -36,6 +36,7 @@ class RequestIdMiddleware:
 
         request_id = uuid4().hex
         scope.setdefault("state", {})["request_id"] = request_id
+        request_id_token = bind_request_id(request_id)
         response_started = False
 
         async def send_with_request_id(message: Message) -> None:
@@ -53,6 +54,8 @@ class RequestIdMiddleware:
                 raise
             response = handle_unexpected_exception(Request(scope), exc)
             await response(scope, receive, send_with_request_id)
+        finally:
+            reset_request_id(request_id_token)
 
 
 def _lifespan(settings: Settings) -> Callable[[FastAPI], AbstractAsyncContextManager[None]]:

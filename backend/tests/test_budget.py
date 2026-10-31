@@ -26,7 +26,7 @@ def test_food_and_buffer_are_omitted_without_configured_rules() -> None:
         attractions=[],
     )
 
-    assert [category.name for category in budget.categories] == ["Transport", "Hotels"]
+    assert [category.name for category in budget.categories] == ["Transport"]
     assert budget.known_subtotal == 0
     assert budget.unknown_categories == []
 

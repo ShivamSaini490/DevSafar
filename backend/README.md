@@ -57,13 +57,25 @@ most one retry. Disabled service, exhausted credits, invalid data, or network fa
 falls back to labelled stub attractions without failing the trip.
 
 Tavily web text is treated only as untrusted data. Social/video results configured in
-`TAVILY_EXCLUDED_DOMAINS` are removed first. For each uncached destination, one Groq
-structured-output call proposes named places and verbatim evidence; Python then requires
+`TAVILY_EXCLUDED_DOMAINS` are removed first. At most
+`TAVILY_SNIPPETS_FOR_EXTRACTION` results (default 4) are sent per city, each capped by
+`ATTRACTION_SNIPPET_MAX_CHARS` (default 700); duplicate and near-empty snippets are
+dropped. Groq structured output proposes named places and verbatim evidence; Python then requires
 the normalized name and evidence to exist in the same snippet, rejects page titles,
 deduplicates names, and caps results with `ATTRACTIONS_PER_DESTINATION` (default 6).
 Only the grounded place objects are cached (`v2` cache key), so a cache hit calls neither
-Tavily nor Groq. Extraction failure or zero grounded results returns the labelled unknown
-fallback and marks the Tavily data source degraded.
+Tavily nor Groq. Failed research is never stored as a successful result; a separate
+`TAVILY_NEGATIVE_CACHE_TTL_SECONDS` cache (default 120 seconds) briefly prevents repeated
+provider hammering. Extraction failure or zero grounded results returns the labelled
+unknown fallback and marks the Tavily data source degraded.
+
+Attraction extraction uses `GROQ_EXTRACTION_MODEL`; leaving it empty reuses `GROQ_MODEL`.
+A smaller model can be selected because Python grounding rejects every place that is not
+literally supported by the supplied source text. A 429 response is retried at most once
+after its `Retry-After`, bounded by `GROQ_MAX_RETRY_WAIT_SECONDS` (default 8). A 400
+structured-output failure gets one JSON-object-mode retry followed by local Pydantic and
+Python grounding validation. Logs contain only safe diagnostics and external-call counts,
+never prompts, snippets, failed generations, or provider keys.
 
 Descriptions are built in Python from the grounded evidence sentence, stripped of HTML,
 Markdown, links, emoji, and excess whitespace, then limited to 200 characters. Fees and

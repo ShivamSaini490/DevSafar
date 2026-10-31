@@ -3,6 +3,7 @@ import logging
 import re
 import traceback
 from collections.abc import Iterable, Mapping, Sequence
+from contextvars import ContextVar, Token
 from datetime import UTC, datetime
 from typing import Any
 
@@ -31,6 +32,19 @@ KEY_VALUE_PATTERN = re.compile(
 )
 
 STANDARD_RECORD_FIELDS = frozenset(logging.makeLogRecord({}).__dict__)
+_REQUEST_ID: ContextVar[str] = ContextVar("request_id", default="unavailable")
+
+
+def bind_request_id(request_id: str) -> Token[str]:
+    return _REQUEST_ID.set(request_id)
+
+
+def reset_request_id(token: Token[str]) -> None:
+    _REQUEST_ID.reset(token)
+
+
+def current_request_id() -> str:
+    return _REQUEST_ID.get()
 
 
 def _is_sensitive_key(key: object) -> bool:

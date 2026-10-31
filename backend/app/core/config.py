@@ -50,7 +50,9 @@ class Settings(BaseSettings):
 
     groq_api_key: SecretStr | None = None
     groq_model: str = "llama-3.3-70b-versatile"
+    groq_extraction_model: str = ""
     groq_timeout_seconds: float = Field(default=30.0, gt=0, le=60)
+    groq_max_retry_wait_seconds: float = Field(default=8.0, ge=0, le=60)
     graph_timeout_seconds: float = Field(default=60.0, gt=0, le=180)
     maps_provider: Literal["stub", "osm"] = "stub"
     osrm_base_url: str = "https://router.project-osrm.org"
@@ -61,9 +63,7 @@ class Settings(BaseSettings):
         max_length=200,
     )
     nominatim_country_code: str = Field(default="in", pattern=r"^[a-zA-Z]{2}$")
-    maps_allowed_hosts: str = (
-        "router.project-osrm.org,nominatim.openstreetmap.org"
-    )
+    maps_allowed_hosts: str = "router.project-osrm.org,nominatim.openstreetmap.org"
     maps_http_timeout_seconds: float = Field(default=10.0, gt=0, le=60)
     geocode_cache_ttl_seconds: int = Field(default=2_592_000, ge=86_400)
     tavily_enabled: bool = False
@@ -72,15 +72,16 @@ class Settings(BaseSettings):
     tavily_allowed_hosts: str = "api.tavily.com"
     tavily_max_searches_per_trip: int = Field(default=2, ge=0, le=10)
     tavily_cache_ttl_seconds: int = Field(default=604_800, ge=60)
+    tavily_negative_cache_ttl_seconds: int = Field(default=120, ge=1, le=3600)
     tavily_timeout_seconds: float = Field(default=10.0, gt=0, le=60)
+    tavily_snippets_for_extraction: int = Field(default=4, ge=1, le=10)
+    attraction_snippet_max_chars: int = Field(default=700, ge=100, le=5000)
     tavily_excluded_domains: str = (
-        "youtube.com,youtu.be,facebook.com,instagram.com,tiktok.com,"
-        "x.com,pinterest.com"
+        "youtube.com,youtu.be,facebook.com,instagram.com,tiktok.com,x.com,pinterest.com"
     )
     attractions_per_destination: int = Field(default=6, ge=1, le=12)
     booking_allowed_hosts: str = (
-        "www.irctc.co.in,www.makemytrip.com,www.redbus.in,"
-        "www.google.com,www.booking.com"
+        "www.irctc.co.in,www.makemytrip.com,www.redbus.in,www.google.com,www.booking.com"
     )
     fuel_cost_per_km: Decimal = Field(default=Decimal("12.00"), gt=0)
     max_driving_hours_per_day: int = Field(default=10, ge=1, le=16)
@@ -248,6 +249,10 @@ class Settings(BaseSettings):
     @property
     def groq_configured(self) -> bool:
         return bool(self.groq_api_key is not None and self.groq_api_key.get_secret_value().strip())
+
+    @property
+    def groq_extraction_model_name(self) -> str:
+        return self.groq_extraction_model.strip() or self.groq_model
 
     @property
     def smtp_use_implicit_tls(self) -> bool:

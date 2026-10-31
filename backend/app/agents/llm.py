@@ -1,8 +1,13 @@
+import asyncio
 import json
-from collections.abc import Callable, Mapping
+import logging
+import re
+from collections.abc import Awaitable, Callable, Mapping
 from contextlib import suppress
-from datetime import date, datetime, time
+from dataclasses import dataclass
+from datetime import UTC, date, datetime, time
 from decimal import Decimal, InvalidOperation
+from email.utils import parsedate_to_datetime
 from typing import Any, Protocol, cast
 
 from langchain_core.exceptions import OutputParserException
@@ -15,7 +20,7 @@ from app.agents.prompts import (
     INTENT_SYSTEM_PROMPT,
 )
 from app.core.config import Settings
-from app.core.logging import redact_sensitive_data
+from app.core.logging import current_request_id, redact_sensitive_data
 from app.schemas.attraction import (
     ATTRACTION_CATEGORIES,
     AttractionCandidate,
@@ -32,6 +37,7 @@ from app.utils.datetime_utils import (
 )
 
 RETURN_TIME_ASSUMPTION = "Return time not specified; assuming 23:59 Asia/Kolkata."
+logger = logging.getLogger(__name__)
 
 _STRICT_JSON_SCHEMA_MODELS = frozenset(
     {
@@ -130,10 +136,28 @@ class AttractionExtractionFailure(Exception):
         *,
         error_type: str,
         http_status: int | None = None,
+        provider_error_code: str | None = None,
+        provider_error_type: str | None = None,
+        retry_after: str | None = None,
+        rate_limit_reset_requests: str | None = None,
+        rate_limit_reset_tokens: str | None = None,
+        external_calls: int = 0,
     ) -> None:
         super().__init__("Groq attraction extraction failed")
         self.error_type = error_type
         self.http_status = http_status
+        self.provider_error_code = provider_error_code
+        self.provider_error_type = provider_error_type
+        self.retry_after = retry_after
+        self.rate_limit_reset_requests = rate_limit_reset_requests
+        self.rate_limit_reset_tokens = rate_limit_reset_tokens
+        self.external_calls = external_calls
+
+
+@dataclass(frozen=True, slots=True)
+class AttractionExtractionResult:
+    candidates: list[AttractionCandidate]
+    external_calls: int
 
 
 class IntentModel(Protocol):
@@ -148,7 +172,7 @@ class AttractionExtractor(Protocol):
         *,
         city: str,
         snippets: list[str],
-    ) -> list[AttractionCandidate]: ...
+    ) -> AttractionExtractionResult: ...
 
 
 class IntentCompletionClient(Protocol):
@@ -158,16 +182,21 @@ class IntentCompletionClient(Protocol):
 def _build_structured_client(
     settings: Settings,
     output_schema: dict[str, Any],
+    *,
+    model_name: str | None = None,
+    force_json_object: bool = False,
 ) -> IntentCompletionClient:
     assert settings.groq_api_key is not None
     chat_model = ChatGroq(
-        model=settings.groq_model,
+        model=model_name or settings.groq_model,
         temperature=0,
         api_key=settings.groq_api_key,
         timeout=settings.groq_timeout_seconds,
         max_retries=0,
     )
-    if settings.groq_model in _STRICT_JSON_SCHEMA_MODELS:
+    if force_json_object:
+        runnable = chat_model.with_structured_output(method="json_mode")
+    elif (model_name or settings.groq_model) in _STRICT_JSON_SCHEMA_MODELS:
         runnable = chat_model.with_structured_output(
             output_schema,
             method="json_schema",
@@ -179,6 +208,117 @@ def _build_structured_client(
             method="json_mode",
         )
     return cast(IntentCompletionClient, runnable)
+
+
+@dataclass(frozen=True, slots=True)
+class _GroqErrorDetails:
+    error_type: str
+    http_status: int | None
+    provider_error_code: str | None
+    provider_error_type: str | None
+    retry_after: str | None
+    rate_limit_reset_requests: str | None
+    rate_limit_reset_tokens: str | None
+
+
+def _safe_header_value(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    cleaned = value.strip()[:100]
+    if not cleaned or "\n" in cleaned or "\r" in cleaned:
+        return None
+    return cleaned
+
+
+def _safe_error_identifier(value: Any) -> str | None:
+    cleaned = _safe_header_value(value)
+    if cleaned is None or re.fullmatch(r"[A-Za-z0-9_.-]+", cleaned) is None:
+        return None
+    return cleaned
+
+
+def _exception_chain(exc: BaseException) -> list[BaseException]:
+    chain: list[BaseException] = []
+    current: BaseException | None = exc
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        chain.append(current)
+        current = current.__cause__ or current.__context__
+    return chain
+
+
+def _groq_error_details(exc: BaseException) -> _GroqErrorDetails:
+    selected = exc
+    for candidate in _exception_chain(exc):
+        if (
+            _exception_http_status(candidate) is not None
+            or _provider_error_body(candidate) is not None
+        ):
+            selected = candidate
+            break
+    body = _provider_error_body(selected)
+    error_body: Mapping[str, Any] = {}
+    if isinstance(body, Mapping):
+        nested = body.get("error")
+        error_body = nested if isinstance(nested, Mapping) else body
+    response = getattr(selected, "response", None)
+    headers = getattr(response, "headers", {})
+
+    def header(name: str) -> str | None:
+        getter = getattr(headers, "get", None)
+        return _safe_header_value(getter(name)) if callable(getter) else None
+
+    return _GroqErrorDetails(
+        error_type=type(selected).__name__,
+        http_status=_exception_http_status(selected),
+        provider_error_code=_safe_error_identifier(error_body.get("code")),
+        provider_error_type=_safe_error_identifier(error_body.get("type")),
+        retry_after=header("retry-after"),
+        rate_limit_reset_requests=header("x-ratelimit-reset-requests"),
+        rate_limit_reset_tokens=header("x-ratelimit-reset-tokens"),
+    )
+
+
+def _retry_after_seconds(value: str | None) -> float | None:
+    if value is None:
+        return 0.0
+    with suppress(ValueError):
+        return max(0.0, float(value))
+    with suppress(ValueError, TypeError, OverflowError):
+        parsed = parsedate_to_datetime(value)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=UTC)
+        return max(0.0, (parsed.astimezone(UTC) - datetime.now(UTC)).total_seconds())
+    duration = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*(ms|s|m)\s*", value, re.IGNORECASE)
+    if duration is None:
+        return None
+    amount = float(duration.group(1))
+    unit = duration.group(2).casefold()
+    return amount / 1000 if unit == "ms" else amount * (60 if unit == "m" else 1)
+
+
+def _log_attraction_error(
+    details: _GroqErrorDetails,
+    *,
+    retry_planned: bool,
+    retry_wait_seconds: float | None,
+) -> None:
+    logger.warning(
+        "Groq attraction extraction call failed",
+        extra={
+            "request_id": current_request_id(),
+            "error_type": details.error_type,
+            "http_status": details.http_status,
+            "groq_error_code": details.provider_error_code,
+            "groq_error_type": details.provider_error_type,
+            "retry_after": details.retry_after,
+            "rate_limit_reset_requests": details.rate_limit_reset_requests,
+            "rate_limit_reset_units": details.rate_limit_reset_tokens,
+            "retry_planned": retry_planned,
+            "retry_wait_seconds": retry_wait_seconds,
+        },
+    )
 
 
 def _exception_http_status(exc: BaseException) -> int | None:
@@ -510,21 +650,34 @@ class GroqIntentModel:
 
 
 class GroqAttractionExtractor:
-    """One-call structured extraction over untrusted Tavily snippet text."""
+    """Bounded structured extraction over untrusted Tavily snippet text."""
 
     def __init__(
         self,
         settings: Settings,
         *,
         client: IntentCompletionClient | None = None,
+        json_client: IntentCompletionClient | None = None,
+        sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     ) -> None:
         self.settings = settings
         self._client = client
+        self._json_client = json_client
+        self._sleep = sleep
 
     def _build_client(self) -> IntentCompletionClient:
         return _build_structured_client(
             self.settings,
             _ATTRACTION_OUTPUT_SCHEMA,
+            model_name=self.settings.groq_extraction_model_name,
+        )
+
+    def _build_json_client(self) -> IntentCompletionClient:
+        return _build_structured_client(
+            self.settings,
+            _ATTRACTION_OUTPUT_SCHEMA,
+            model_name=self.settings.groq_extraction_model_name,
+            force_json_object=True,
         )
 
     async def extract_attractions(
@@ -532,7 +685,7 @@ class GroqAttractionExtractor:
         *,
         city: str,
         snippets: list[str],
-    ) -> list[AttractionCandidate]:
+    ) -> AttractionExtractionResult:
         if not self.settings.groq_configured:
             raise AttractionExtractionFailure(
                 error_type="GroqConfigurationError",
@@ -561,13 +714,53 @@ class GroqAttractionExtractor:
             ),
         ]
         model = self._client or self._build_client()
-        try:
-            result = await model.ainvoke(messages)
-            if isinstance(result, str):
-                result = json.loads(result)
-            return AttractionExtraction.model_validate(result).attractions
-        except Exception as exc:
-            raise AttractionExtractionFailure(
-                error_type=type(exc).__name__,
-                http_status=_exception_http_status(exc),
-            ) from exc
+        external_calls = 0
+        last_details: _GroqErrorDetails | None = None
+        for attempt in range(2):
+            try:
+                external_calls += 1
+                result = await model.ainvoke(messages)
+                if isinstance(result, str):
+                    result = json.loads(result)
+                candidates = AttractionExtraction.model_validate(result).attractions
+                return AttractionExtractionResult(
+                    candidates=candidates,
+                    external_calls=external_calls,
+                )
+            except Exception as exc:
+                details = _groq_error_details(exc)
+                last_details = details
+                retry_wait_seconds: float | None = None
+                retry_planned = False
+                if attempt == 0 and details.http_status == 429:
+                    retry_wait_seconds = _retry_after_seconds(details.retry_after)
+                    retry_planned = (
+                        retry_wait_seconds is not None
+                        and retry_wait_seconds <= self.settings.groq_max_retry_wait_seconds
+                    )
+                elif attempt == 0 and details.http_status == 400:
+                    retry_planned = True
+                _log_attraction_error(
+                    details,
+                    retry_planned=retry_planned,
+                    retry_wait_seconds=retry_wait_seconds,
+                )
+                if not retry_planned:
+                    break
+                if details.http_status == 429:
+                    assert retry_wait_seconds is not None
+                    if retry_wait_seconds:
+                        await self._sleep(retry_wait_seconds)
+                else:
+                    model = self._json_client or self._build_json_client()
+        assert last_details is not None
+        raise AttractionExtractionFailure(
+            error_type=last_details.error_type,
+            http_status=last_details.http_status,
+            provider_error_code=last_details.provider_error_code,
+            provider_error_type=last_details.provider_error_type,
+            retry_after=last_details.retry_after,
+            rate_limit_reset_requests=last_details.rate_limit_reset_requests,
+            rate_limit_reset_tokens=last_details.rate_limit_reset_tokens,
+            external_calls=external_calls,
+        )

@@ -74,17 +74,18 @@ class BudgetService:
                 amounts=priced_transport,
                 fetched_at=fetched_at,
                 source=transport_source,
-            ),
-            _priced_category(
-                name="Hotels",
-                amounts=priced_hotels,
-                fetched_at=fetched_at,
-            ),
+            )
         ]
+        if hotels:
+            categories.append(
+                _priced_category(
+                    name="Hotels",
+                    amounts=priced_hotels,
+                    fetched_at=fetched_at,
+                )
+            )
         if attractions:
-            known_attraction_prices = [
-                amount for amount in attraction_prices if amount is not None
-            ]
+            known_attraction_prices = [amount for amount in attraction_prices if amount is not None]
             if known_attraction_prices:
                 categories.append(
                     _priced_category(

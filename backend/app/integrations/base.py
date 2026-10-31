@@ -137,7 +137,7 @@ class StubPlacesProvider:
             AttractionOption(
                 destination=destination,
                 name=f"Stub attraction in {destination}",
-                description="Placeholder only; live places data is not connected.",
+                description="Attraction research unavailable for this destination right now.",
                 entry_fee=PriceQuote(
                     amount=None,
                     price_type="unknown",
@@ -184,9 +184,7 @@ class ProviderBundle:
             places_source_name=self.places_source_name,
         )
 
-    def with_places(
-        self, places: PlacesProvider, *, source_name: str
-    ) -> "ProviderBundle":
+    def with_places(self, places: PlacesProvider, *, source_name: str) -> "ProviderBundle":
         return ProviderBundle(
             maps=self.maps,
             transport=self.transport,
@@ -211,14 +209,9 @@ def provider_sources(
     )
     tavily_degraded = bundle.places_source_name == "tavily" and (
         not attractions
-        or any(
-            item.source_url is None or item.entry_fee.source == "stub"
-            for item in attractions
-        )
+        or any(item.source_url is None or item.entry_fee.source == "stub" for item in attractions)
     )
-    sources: tuple[
-        tuple[str, PriceType, Literal["ok", "degraded"]], ...
-    ] = (
+    sources: tuple[tuple[str, PriceType, Literal["ok", "degraded"]], ...] = (
         (
             bundle.maps_source_name,
             maps_price_type,
@@ -235,10 +228,7 @@ def provider_sources(
             (
                 "estimate"
                 if bundle.places_source_name == "tavily"
-                and any(
-                    item.entry_fee.price_type == "estimate"
-                    for item in attractions or []
-                )
+                and any(item.entry_fee.price_type == "estimate" for item in attractions or [])
                 else "unknown"
             ),
             (
