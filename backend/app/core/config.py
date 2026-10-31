@@ -68,6 +68,7 @@ class Settings(BaseSettings):
     geocode_cache_ttl_seconds: int = Field(default=2_592_000, ge=86_400)
     fuel_cost_per_km: Decimal = Field(default=Decimal("12.00"), gt=0)
     max_driving_hours_per_day: int = Field(default=10, ge=1, le=16)
+    min_stay_hours_per_destination: int = Field(default=6, ge=1, le=48)
     food_estimate_per_day_per_traveler: Decimal | None = Field(
         default=None,
         ge=0,

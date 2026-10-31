@@ -35,6 +35,7 @@ class RouteService:
         *,
         use_stub_defaults: bool = True,
         max_driving_hours_per_day: int = 10,
+        min_stay_hours_per_destination: int = 6,
         now: datetime | None = None,
     ) -> list[RouteLeg]:
         if requirements.start_date is None:
@@ -75,15 +76,6 @@ class RouteService:
             else:
                 selected.append(unused_options.pop(match_index))
 
-        day_count = max(
-            1,
-            (
-                (requirements.end_date - requirements.start_date).days + 1
-                if requirements.end_date is not None
-                else 1
-            ),
-        )
-        leg_count = len(selected)
         previous_arrival: datetime | None = None
         schedule_known = True
         driven_minutes_by_date: dict[date, int] = {}
@@ -91,11 +83,24 @@ class RouteService:
         current_time = as_india_time(now or india_now())
         scheduled: list[RouteLeg] = []
         for index, leg in enumerate(selected):
-            day_offset = 0 if leg_count == 1 else (index * (day_count - 1)) // (leg_count - 1)
-            planned_departure = at_india_time(
-                requirements.start_date + timedelta(days=day_offset),
-                hour=DEFAULT_DEPARTURE_HOUR,
-            )
+            if index == 0:
+                planned_departure = at_india_time(
+                    requirements.start_date,
+                    hour=DEFAULT_DEPARTURE_HOUR,
+                )
+            elif previous_arrival is not None:
+                stay_hours = (
+                    min_stay_hours_per_destination
+                    if requirements.origin is None
+                    or leg.origin.casefold() != requirements.origin.casefold()
+                    else 0
+                )
+                planned_departure = previous_arrival + timedelta(hours=stay_hours)
+            else:
+                planned_departure = at_india_time(
+                    requirements.start_date,
+                    hour=DEFAULT_DEPARTURE_HOUR,
+                )
             if index == 0 and requirements.start_date == current_time.date():
                 planned_departure = max(
                     planned_departure,
@@ -214,6 +219,7 @@ class RouteService:
         *,
         daily_hours: int,
         start_date: date | None = None,
+        baseline_return_at: datetime | None = None,
     ) -> list[str]:
         warnings = [
             (
@@ -231,12 +237,28 @@ class RouteService:
                 return warnings
             default_departure = at_india_time(start_date, hour=6)
             if first_departure > default_departure:
+                actual_return_at = next(
+                    (
+                        leg.arrival_at
+                        for leg in reversed(route_legs)
+                        if leg.arrival_at is not None
+                    ),
+                    None,
+                )
+                added_hours = (
+                    max(
+                        0.0,
+                        (actual_return_at - baseline_return_at).total_seconds() / 3600,
+                    )
+                    if actual_return_at is not None and baseline_return_at is not None
+                    else (first_departure - default_departure).total_seconds() / 3600
+                )
                 warnings.insert(
                     0,
                     (
-                        "First departure shifted to "
-                        f"{first_departure.isoformat()} because the earlier 06:00 "
-                        "slot has passed."
+                        f"Schedule start shifted from {default_departure.isoformat()} to "
+                        f"{first_departure.isoformat()}; this adds {added_hours:.1f} hours "
+                        "to the return arrival."
                     ),
                 )
         return warnings

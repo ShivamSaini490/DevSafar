@@ -247,8 +247,14 @@ async def _run_road_plan(
     duration_minutes: int,
     deadline: datetime,
     now: datetime | None = None,
+    min_stay_hours: int = 6,
 ) -> TripResponse:
-    osm_settings = settings.model_copy(update={"maps_provider": "osm"})
+    osm_settings = settings.model_copy(
+        update={
+            "maps_provider": "osm",
+            "min_stay_hours_per_destination": min_stay_hours,
+        }
+    )
     requirements = TripRequirements(
         origin="Hyderabad",
         destinations=["Puducherry"],
@@ -353,7 +359,7 @@ async def test_long_road_route_uses_multi_day_schedule_and_misses_deadline(
         for day in response.itinerary_days
     )
     assert any(
-        activity.title == "Pass through Puducherry, no stay planned"
+        activity.title == "Stay in Puducherry"
         for day in response.itinerary_days
         for activity in day.activities
     )
@@ -365,12 +371,12 @@ async def test_short_verified_road_route_is_feasible(settings: Settings) -> None
         settings,
         distance_km=Decimal("100"),
         duration_minutes=120,
-        deadline=datetime(2026, 10, 30, 12, tzinfo=INDIA_TIME_ZONE),
+        deadline=datetime(2026, 10, 30, 18, tzinfo=INDIA_TIME_ZONE),
     )
     assert response.feasible is True
     assert response.status == "completed"
     assert response.route_legs[-1].arrival_at == datetime(
-        2026, 10, 30, 10, tzinfo=INDIA_TIME_ZONE
+        2026, 10, 30, 16, tzinfo=INDIA_TIME_ZONE
     )
     assert response.budget.known_subtotal >= Decimal("2400.00")
     assert response.data_sources[0].name == "osrm"
@@ -379,17 +385,91 @@ async def test_short_verified_road_route_is_feasible(settings: Settings) -> None
 
 @pytest.mark.asyncio
 async def test_same_day_start_uses_next_sensible_slot_and_warns(settings: Settings) -> None:
+    fixed_now = datetime(2026, 10, 30, 14, 10, tzinfo=INDIA_TIME_ZONE)
     response = await _run_road_plan(
         settings,
         distance_km=Decimal("50"),
         duration_minutes=60,
         deadline=datetime(2026, 10, 31, 12, tzinfo=INDIA_TIME_ZONE),
-        now=datetime(2026, 10, 30, 14, 10, tzinfo=INDIA_TIME_ZONE),
+        now=fixed_now,
     )
     assert response.route_legs[0].departure_at == datetime(
         2026, 10, 30, 14, 30, tzinfo=INDIA_TIME_ZONE
     )
-    assert any("First departure shifted" in warning for warning in response.warnings)
+    shift_warning = next(
+        warning for warning in response.warnings if warning.startswith("Schedule start shifted")
+    )
+    assert "adds 17.0 hours to the return arrival" in shift_warning
+    assert all(
+        activity.starts_at is not None and activity.starts_at >= fixed_now
+        for day in response.itinerary_days
+        for activity in day.activities
+    )
+
+    stay = next(
+        activity
+        for day in response.itinerary_days
+        for activity in day.activities
+        if activity.title == "Stay in Puducherry"
+    )
+    assert stay.starts_at is not None
+    assert stay.ends_at is not None
+    assert (stay.ends_at - stay.starts_at).total_seconds() >= 6 * 3600
+    next_leg = response.route_legs[1]
+    assert next_leg.departure_at == stay.ends_at
+    destination_hotel = next(
+        hotel for hotel in response.hotels if hotel.destination == "Puducherry"
+    )
+    assert destination_hotel.check_in == stay.starts_at.date()
+    assert destination_hotel.check_out == next_leg.departure_at.date()
+
+
+@pytest.mark.asyncio
+async def test_return_deadline_calculation_includes_destination_stay(
+    settings: Settings,
+) -> None:
+    response = await _run_road_plan(
+        settings,
+        distance_km=Decimal("100"),
+        duration_minutes=120,
+        deadline=datetime(2026, 10, 30, 15, tzinfo=INDIA_TIME_ZONE),
+    )
+    assert response.route_legs[0].arrival_at == datetime(
+        2026, 10, 30, 8, tzinfo=INDIA_TIME_ZONE
+    )
+    assert response.route_legs[1].departure_at == datetime(
+        2026, 10, 30, 14, tzinfo=INDIA_TIME_ZONE
+    )
+    assert response.route_legs[1].arrival_at == datetime(
+        2026, 10, 30, 16, tzinfo=INDIA_TIME_ZONE
+    )
+    assert response.feasible is False
+    assert any("misses the required return deadline" in warning for warning in response.warnings)
+
+
+@pytest.mark.asyncio
+async def test_configured_minimum_stay_is_applied_to_every_destination(
+    settings: Settings,
+) -> None:
+    response = await _run_road_plan(
+        settings,
+        distance_km=Decimal("50"),
+        duration_minutes=60,
+        deadline=datetime(2026, 10, 31, 12, tzinfo=INDIA_TIME_ZONE),
+        min_stay_hours=8,
+    )
+    stays = [
+        activity
+        for day in response.itinerary_days
+        for activity in day.activities
+        if activity.title.startswith("Stay in ")
+    ]
+    assert {stay.location for stay in stays} == {"Puducherry"}
+    assert all(stay.starts_at is not None and stay.ends_at is not None for stay in stays)
+    assert all(
+        (stay.ends_at - stay.starts_at).total_seconds() >= 8 * 3600  # type: ignore[operator]
+        for stay in stays
+    )
 
 
 @pytest.mark.asyncio

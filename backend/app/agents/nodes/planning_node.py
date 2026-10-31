@@ -9,7 +9,7 @@ from app.services.hotel_service import HotelService
 from app.services.itinerary_service import ItineraryService
 from app.services.route_service import RouteService
 from app.services.transport_service import TransportService
-from app.utils.datetime_utils import india_now
+from app.utils.datetime_utils import at_india_time, india_now
 
 
 def build_planning_node(
@@ -22,13 +22,39 @@ def build_planning_node(
         if requirements is None:
             raise ValueError("Planning requires trip requirements")
         is_retry = bool(state["validation_errors"])
+        planning_now = now_provider()
         route_legs = RouteService.build_route(
             requirements,
             state["route_options"],
             use_stub_defaults=settings.maps_provider == "stub",
             max_driving_hours_per_day=settings.max_driving_hours_per_day,
-            now=now_provider(),
+            min_stay_hours_per_destination=settings.min_stay_hours_per_destination,
+            now=planning_now,
         )
+        baseline_return_at: datetime | None = None
+        first_departure = route_legs[0].departure_at if route_legs else None
+        if (
+            requirements.start_date is not None
+            and first_departure is not None
+            and first_departure
+            > at_india_time(requirements.start_date, hour=6)
+        ):
+            baseline_legs = RouteService.build_route(
+                requirements,
+                state["route_options"],
+                use_stub_defaults=settings.maps_provider == "stub",
+                max_driving_hours_per_day=settings.max_driving_hours_per_day,
+                min_stay_hours_per_destination=settings.min_stay_hours_per_destination,
+                now=at_india_time(requirements.start_date, hour=5),
+            )
+            baseline_return_at = next(
+                (
+                    leg.arrival_at
+                    for leg in reversed(baseline_legs)
+                    if leg.arrival_at is not None
+                ),
+                None,
+            )
         transport_options = (
             TransportService.from_route_legs(route_legs)
             if settings.maps_provider == "osm"
@@ -38,12 +64,18 @@ def build_planning_node(
             requirements,
             route_legs,
             state["hotels"],
+            min_stay_hours_per_destination=settings.min_stay_hours_per_destination,
         )
         return {
             "route_options": route_legs,
             "transport_options": transport_options,
             "hotels": hotels,
-            "itinerary": ItineraryService.build(requirements, route_legs),
+            "itinerary": ItineraryService.build(
+                requirements,
+                route_legs,
+                min_stay_hours_per_destination=settings.min_stay_hours_per_destination,
+                now=planning_now,
+            ),
             "budget_breakdown": BudgetService.build(
                 requirements=requirements,
                 route_legs=route_legs,
@@ -63,6 +95,7 @@ def build_planning_node(
                             route_legs,
                             daily_hours=settings.max_driving_hours_per_day,
                             start_date=requirements.start_date,
+                            baseline_return_at=baseline_return_at,
                         ),
                         *(
                             [

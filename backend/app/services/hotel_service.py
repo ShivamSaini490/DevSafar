@@ -11,11 +11,12 @@ class HotelService:
         requirements: TripRequirements,
         route_legs: list[RouteLeg],
         hotel_options: list[HotelOption],
+        *,
+        min_stay_hours_per_destination: int = 6,
     ) -> list[HotelOption]:
         if requirements.origin is None:
             return []
         aligned: list[HotelOption] = []
-        used_option_ids: set[int] = set()
         rest_template = hotel_options[0] if hotel_options else None
         if rest_template is not None:
             for leg in route_legs:
@@ -60,24 +61,26 @@ class HotelService:
                 ),
                 None,
             )
-            if departure_leg is None or departure_leg.departure_at is None:
-                continue
+            stay_end = (
+                departure_leg.departure_at
+                if departure_leg is not None and departure_leg.departure_at is not None
+                else arrival_leg.arrival_at
+                + timedelta(hours=min_stay_hours_per_destination)
+            )
             check_in = arrival_leg.arrival_at.date()
-            check_out = departure_leg.departure_at.date()
+            check_out = stay_end.date()
             if check_out <= check_in:
                 continue
             option = next(
                 (
                     candidate
                     for candidate in hotel_options
-                    if id(candidate) not in used_option_ids
-                    and candidate.destination.casefold() == arrival_leg.destination.casefold()
+                    if candidate.destination.casefold() == arrival_leg.destination.casefold()
                 ),
                 None,
             )
             if option is None:
                 continue
-            used_option_ids.add(id(option))
             nights = (check_out - check_in).days
             nightly_amount = option.nightly_price.amount
             total_price = option.total_price.model_copy(
