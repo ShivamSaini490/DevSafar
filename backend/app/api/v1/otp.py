@@ -1,6 +1,6 @@
 from typing import Annotated, cast
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, BackgroundTasks, Depends, Request
 from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -18,8 +18,12 @@ from app.schemas.otp import (
     ResetPasswordRequest,
     VerifyOtpRequest,
 )
-from app.services.email_service import EmailSender, build_email_sender
-from app.services.otp_service import OtpService
+from app.services.email_service import (
+    EmailSender,
+    build_email_sender,
+    send_password_reset_otp_safely,
+)
+from app.services.otp_service import GENERIC_FORGOT_MESSAGE, OtpEmailDelivery, OtpService
 
 router = APIRouter(prefix="/auth", tags=["password-reset"])
 
@@ -34,6 +38,27 @@ def get_email_sender(
 
 def _client_ip(request: Request) -> str:
     return request.client.host if request.client else "unknown"
+
+
+def _queue_otp_email(
+    background_tasks: BackgroundTasks,
+    delivery: OtpEmailDelivery | None,
+    *,
+    email_sender: EmailSender,
+    request: Request,
+    settings: Settings,
+) -> None:
+    if delivery is None:
+        return
+    background_tasks.add_task(
+        send_password_reset_otp_safely,
+        email_sender,
+        recipient=delivery.recipient,
+        code=delivery.code,
+        expires_at=delivery.expires_at,
+        request_id=getattr(request.state, "request_id", "unavailable"),
+        settings=settings,
+    )
 
 
 async def _limit_otp_request(
@@ -58,28 +83,44 @@ async def _limit_otp_request(
 async def forgot_password(
     payload: EmailRequest,
     request: Request,
+    background_tasks: BackgroundTasks,
     db: Annotated[AsyncSession, Depends(get_db_session)],
     redis: Annotated[Redis, Depends(get_redis_client)],
     settings: Annotated[Settings, Depends(get_request_settings)],
     email_sender: Annotated[EmailSender, Depends(get_email_sender)],
 ) -> GenericOtpResponse:
     await _limit_otp_request(request=request, email=payload.email, redis=redis, settings=settings)
-    message = await OtpService(db, settings, email_sender).forgot_password(payload.email)
-    return GenericOtpResponse(message=message)
+    delivery = await OtpService(db, settings, email_sender).forgot_password(payload.email)
+    _queue_otp_email(
+        background_tasks,
+        delivery,
+        email_sender=email_sender,
+        request=request,
+        settings=settings,
+    )
+    return GenericOtpResponse(message=GENERIC_FORGOT_MESSAGE)
 
 
 @router.post("/resend-otp", response_model=GenericOtpResponse)
 async def resend_otp(
     payload: EmailRequest,
     request: Request,
+    background_tasks: BackgroundTasks,
     db: Annotated[AsyncSession, Depends(get_db_session)],
     redis: Annotated[Redis, Depends(get_redis_client)],
     settings: Annotated[Settings, Depends(get_request_settings)],
     email_sender: Annotated[EmailSender, Depends(get_email_sender)],
 ) -> GenericOtpResponse:
     await _limit_otp_request(request=request, email=payload.email, redis=redis, settings=settings)
-    message = await OtpService(db, settings, email_sender).resend(payload.email)
-    return GenericOtpResponse(message=message)
+    delivery = await OtpService(db, settings, email_sender).resend(payload.email)
+    _queue_otp_email(
+        background_tasks,
+        delivery,
+        email_sender=email_sender,
+        request=request,
+        settings=settings,
+    )
+    return GenericOtpResponse(message=GENERIC_FORGOT_MESSAGE)
 
 
 @router.post("/verify-otp", response_model=ResetGrantResponse)

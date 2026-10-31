@@ -28,6 +28,7 @@ def build_planning_node(
             state["route_options"],
             use_stub_defaults=settings.maps_provider == "stub",
             max_driving_hours_per_day=settings.max_driving_hours_per_day,
+            driving_latest_arrival_hour=settings.driving_latest_arrival_hour,
             min_stay_hours_per_destination=settings.min_stay_hours_per_destination,
             now=planning_now,
         )
@@ -44,6 +45,7 @@ def build_planning_node(
                 state["route_options"],
                 use_stub_defaults=settings.maps_provider == "stub",
                 max_driving_hours_per_day=settings.max_driving_hours_per_day,
+                driving_latest_arrival_hour=settings.driving_latest_arrival_hour,
                 min_stay_hours_per_destination=settings.min_stay_hours_per_destination,
                 now=at_india_time(requirements.start_date, hour=5),
             )
@@ -94,6 +96,7 @@ def build_planning_node(
                         *RouteService.schedule_warnings(
                             route_legs,
                             daily_hours=settings.max_driving_hours_per_day,
+                            latest_arrival_hour=settings.driving_latest_arrival_hour,
                             start_date=requirements.start_date,
                             baseline_return_at=baseline_return_at,
                         ),

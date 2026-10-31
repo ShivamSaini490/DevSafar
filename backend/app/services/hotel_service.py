@@ -20,6 +20,8 @@ class HotelService:
         rest_template = hotel_options[0] if hotel_options else None
         if rest_template is not None:
             for leg in route_legs:
+                if leg.overnight_stops == 0:
+                    continue
                 for current_segment, next_segment in zip(
                     leg.driving_segments,
                     leg.driving_segments[1:],

@@ -344,6 +344,10 @@ async def test_realistic_groq_json_normalizes_full_example_prompt(
 
     for hotel in trip["hotels"]:
         assert hotel["destination"] != "Hyderabad"
+        if hotel["destination"] == "en route":
+            assert hotel["name"].startswith("Overnight rest stop between")
+            assert hotel["total_price"]["source"] == "stub_overnight_rest_estimate"
+            continue
         arrival_leg = next(
             leg for leg in trip["route_legs"] if leg["destination"] == hotel["destination"]
         )

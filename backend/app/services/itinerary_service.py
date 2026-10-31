@@ -58,15 +58,12 @@ class ItineraryService:
                 if index + 1 < len(route_legs) and route_legs[index + 1].origin == leg.destination
                 else None
             )
-            arrival_end = arrival_at + timedelta(minutes=30)
-            if next_departure is not None:
-                arrival_end = min(arrival_end, next_departure)
             activities_by_date[arrival_at.date()].append(
                 ItineraryActivity(
                     title=f"Arrive in {leg.destination}",
                     location=leg.destination,
                     starts_at=arrival_at,
-                    ends_at=max(arrival_at, arrival_end),
+                    ends_at=arrival_at,
                     notes=(
                         f"Arrival after {leg.duration_minutes} minutes of "
                         f"{leg.mode} travel; duration source: "
@@ -134,7 +131,7 @@ class ItineraryService:
                 if (
                     starts_at is not None
                     and activity.ends_at is not None
-                    and activity.ends_at <= starts_at
+                    and activity.ends_at < starts_at
                 ):
                     continue
                 activities.append(activity.model_copy(update={"starts_at": starts_at}))

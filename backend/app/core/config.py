@@ -68,6 +68,7 @@ class Settings(BaseSettings):
     geocode_cache_ttl_seconds: int = Field(default=2_592_000, ge=86_400)
     fuel_cost_per_km: Decimal = Field(default=Decimal("12.00"), gt=0)
     max_driving_hours_per_day: int = Field(default=10, ge=1, le=16)
+    driving_latest_arrival_hour: int = Field(default=21, ge=7, le=23)
     min_stay_hours_per_destination: int = Field(default=6, ge=1, le=48)
     food_estimate_per_day_per_traveler: Decimal | None = Field(
         default=None,
@@ -88,6 +89,7 @@ class Settings(BaseSettings):
     smtp_username: str | None = None
     smtp_password: SecretStr | None = None
     smtp_use_tls: bool = True
+    smtp_timeout_seconds: float = Field(default=10.0, gt=0, le=60)
     smtp_from_email: str | None = None
     dev_otp_email_fallback_enabled: bool = False
 
@@ -190,6 +192,47 @@ class Settings(BaseSettings):
     @property
     def groq_configured(self) -> bool:
         return bool(self.groq_api_key is not None and self.groq_api_key.get_secret_value().strip())
+
+    @property
+    def smtp_use_implicit_tls(self) -> bool:
+        if self.smtp_port == 465:
+            return True
+        if self.smtp_port == 587:
+            return False
+        return self.smtp_use_tls
+
+    @property
+    def smtp_start_tls(self) -> bool:
+        if self.smtp_port == 465:
+            return False
+        if self.smtp_port == 587:
+            return True
+        return not self.smtp_use_tls
+
+    def smtp_configuration_warnings(self) -> tuple[str, ...]:
+        if not self.smtp_host:
+            return ()
+        warnings: list[str] = []
+        if self.smtp_port == 587 and self.smtp_use_tls:
+            warnings.append(
+                "SMTP port 587 requires STARTTLS; SMTP_USE_TLS should be false. "
+                "DevSafar will use STARTTLS for this standard port."
+            )
+        if self.smtp_port == 465 and not self.smtp_use_tls:
+            warnings.append(
+                "SMTP port 465 requires implicit TLS; SMTP_USE_TLS should be true. "
+                "DevSafar will use implicit TLS for this standard port."
+            )
+        username_missing = not self.smtp_username or not self.smtp_username.strip()
+        password_missing = (
+            self.smtp_password is None or not self.smtp_password.get_secret_value().strip()
+        )
+        if username_missing or password_missing:
+            warnings.append(
+                "SMTP_HOST is configured but SMTP_USERNAME or SMTP_PASSWORD is empty; "
+                "OTP email delivery will fail safely in the background."
+            )
+        return tuple(warnings)
 
     def redaction_secret_values(self) -> tuple[str, ...]:
         optional_secrets = (

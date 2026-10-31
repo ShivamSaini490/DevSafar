@@ -117,6 +117,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "SECRET_KEY is not configured; using an ephemeral development key. "
             "Authentication sessions will be invalid after restart."
         )
+    for smtp_warning in app_settings.smtp_configuration_warnings():
+        logger.warning(smtp_warning)
 
     application = FastAPI(
         title=app_settings.app_name,

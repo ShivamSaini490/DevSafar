@@ -255,7 +255,7 @@ async def test_stub_provenance_and_prompt_injection_cannot_change_contract(
         *(place.entry_fee for place in response.attractions),
     ]
     assert prices
-    assert all(price.source == "stub" for price in prices)
+    assert all(price.source.startswith("stub") for price in prices)
     assert all(price.price_type != "live_quote" for price in prices)
     assert all(price.amount is None for price in prices if price.price_type == "unknown")
 

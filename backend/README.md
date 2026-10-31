@@ -8,6 +8,16 @@ sent only in an HttpOnly SameSite=Lax cookie; authenticated writes also require 
 double-submit CSRF cookie/header pair. Password-reset OTPs and reset grants are stored
 only as keyed hashes. For local development, SMTP-less OTP delivery is skipped only when
 `ENVIRONMENT=development` and `DEV_OTP_EMAIL_FALLBACK_ENABLED=true`; the code is never logged.
+Forgot-password and resend delivery runs as a FastAPI background task after the generic
+response is sent. SMTP failures are warning-only and cannot change the public response.
+
+For SMTP, `SMTP_USE_TLS=true` means implicit TLS and normally pairs with port 465.
+`SMTP_USE_TLS=false` means STARTTLS and normally pairs with port 587. Standard ports are
+always mapped safely (587 uses `start_tls=True, use_tls=False`; 465 uses
+`use_tls=True, start_tls=False`) and an inconsistent setting logs a startup warning.
+`SMTP_TIMEOUT_SECONDS` bounds connect and SMTP command waits. When using Gmail, enable
+2-Step Verification, set `SMTP_USERNAME` to the full Gmail address, and paste the Gmail
+app password into `SMTP_PASSWORD` without spaces.
 
 Set a persistent, random `SECRET_KEY` in the local environment for stable development
 sessions. If it is absent only in `development`, the app generates a process-local key and
@@ -34,6 +44,11 @@ are calculated in Python. Maps, transport, hotel, and places integrations are cl
 labelled stubs and never emit `live_quote`. Configure `GROQ_MODEL`,
 `GROQ_TIMEOUT_SECONDS`, and `GRAPH_TIMEOUT_SECONDS` as needed. Missing or failed Groq
 configuration returns a public-safe `503` instead of an internal error.
+
+Road schedules start driving days at 06:00 India time. `MAX_DRIVING_HOURS_PER_DAY`
+limits cumulative driving time per calendar day, while `DRIVING_LATEST_ARRIVAL_HOUR`
+(default 21) is the clock cutoff. An en-route hotel is added only when a leg actually
+crosses an overnight rest boundary.
 
 Saved chat turns persist the strict `TripResponse` and a versioned itinerary in PostgreSQL.
 `GET /api/v1/trips/{trip_id}` enforces the same owner and unexpired-conversation rules as

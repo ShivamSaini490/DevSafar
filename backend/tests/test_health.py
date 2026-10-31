@@ -87,6 +87,28 @@ def test_settings_keep_external_secrets_optional_and_tracing_off() -> None:
     assert settings.langsmith_tracing is False
 
 
+def test_smtp_inconsistent_tls_and_missing_credentials_warn_at_startup(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    from app.main import create_app
+
+    settings = Settings(
+        _env_file=None,
+        environment="test",
+        smtp_host="smtp.example.test",
+        smtp_port=587,
+        smtp_use_tls=True,
+        smtp_username="",
+        smtp_password=None,
+    )
+
+    with caplog.at_level(logging.WARNING):
+        create_app(settings)
+
+    assert "SMTP port 587 requires STARTTLS; SMTP_USE_TLS should be false" in caplog.text
+    assert "SMTP_HOST is configured but SMTP_USERNAME or SMTP_PASSWORD is empty" in caplog.text
+
+
 def test_default_env_file_is_resolved_from_backend_root() -> None:
     expected = Path(config_module.__file__).resolve().parents[2] / ".env"
 

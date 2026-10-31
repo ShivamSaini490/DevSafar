@@ -1,4 +1,4 @@
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 from typing import NoReturn
 
@@ -248,6 +248,7 @@ async def _run_road_plan(
     deadline: datetime,
     now: datetime | None = None,
     min_stay_hours: int = 6,
+    destination: str = "Puducherry",
 ) -> TripResponse:
     osm_settings = settings.model_copy(
         update={
@@ -257,7 +258,7 @@ async def _run_road_plan(
     )
     requirements = TripRequirements(
         origin="Hyderabad",
-        destinations=["Puducherry"],
+        destinations=[destination],
         start_date=date(2026, 10, 30),
         end_date=date(2026, 10, 30),
         budget=Decimal("1000000"),
@@ -287,6 +288,83 @@ async def _run_road_plan(
         previous_trip=None,
         chat_mode="saved",
     )
+
+
+def _assert_no_positive_duration_overlaps(response: TripResponse) -> None:
+    activities = sorted(
+        (
+            activity
+            for day in response.itinerary_days
+            for activity in day.activities
+            if activity.starts_at is not None and activity.ends_at is not None
+        ),
+        key=lambda activity: activity.starts_at,  # type: ignore[arg-type,return-value]
+    )
+    for previous, current in zip(activities, activities[1:], strict=False):
+        assert previous.ends_at is not None
+        assert current.starts_at is not None
+        if previous.ends_at > previous.starts_at:  # type: ignore[operator]
+            assert previous.ends_at <= current.starts_at
+
+
+@pytest.mark.asyncio
+async def test_vijayawada_round_trip_stays_six_hours_and_returns_same_day(
+    settings: Settings,
+) -> None:
+    response = await _run_road_plan(
+        settings,
+        distance_km=Decimal("268"),
+        duration_minutes=216,
+        deadline=datetime(2026, 10, 30, 21, tzinfo=INDIA_TIME_ZONE),
+        destination="Vijayawada",
+    )
+
+    assert response.feasible is True
+    assert all(leg.overnight_stops == 0 for leg in response.route_legs)
+    assert not any(hotel.destination == "en route" for hotel in response.hotels)
+    assert response.route_legs[-1].arrival_at == datetime(
+        2026, 10, 30, 19, 12, tzinfo=INDIA_TIME_ZONE
+    )
+    stay = next(
+        activity
+        for day in response.itinerary_days
+        for activity in day.activities
+        if activity.title == "Stay in Vijayawada"
+    )
+    assert stay.ends_at is not None and stay.starts_at is not None
+    assert stay.ends_at - stay.starts_at == timedelta(hours=6)
+    _assert_no_positive_duration_overlaps(response)
+
+
+@pytest.mark.asyncio
+async def test_1100_km_leg_splits_within_daily_and_clock_limits(settings: Settings) -> None:
+    response = await _run_road_plan(
+        settings,
+        distance_km=Decimal("1100"),
+        duration_minutes=900,
+        deadline=datetime(2026, 11, 5, 21, tzinfo=INDIA_TIME_ZONE),
+    )
+
+    assert response.route_legs[0].overnight_stops >= 1
+    assert len(response.route_legs[0].driving_segments) >= 2
+    for leg in response.route_legs:
+        driven_by_date: dict[date, int] = {}
+        for segment in leg.driving_segments:
+            minutes = int((segment.ends_at - segment.starts_at).total_seconds() // 60)
+            driven_by_date[segment.starts_at.date()] = (
+                driven_by_date.get(segment.starts_at.date(), 0) + minutes
+            )
+            latest = datetime.combine(
+                segment.ends_at.date(),
+                datetime.min.time(),
+                tzinfo=INDIA_TIME_ZONE,
+            ).replace(hour=settings.driving_latest_arrival_hour)
+            assert segment.ends_at <= latest
+        assert all(
+            minutes <= settings.max_driving_hours_per_day * 60
+            for minutes in driven_by_date.values()
+        )
+    _assert_no_positive_duration_overlaps(response)
 
 
 @pytest.mark.asyncio

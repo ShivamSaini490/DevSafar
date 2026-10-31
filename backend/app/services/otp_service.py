@@ -1,5 +1,6 @@
 import asyncio
-from datetime import timedelta
+from dataclasses import dataclass
+from datetime import datetime, timedelta
 from time import monotonic
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -22,6 +23,13 @@ GENERIC_FORGOT_MESSAGE = "If an account exists, a password reset code has been s
 MINIMUM_FORGOT_RESPONSE_SECONDS = 0.2
 
 
+@dataclass(frozen=True, slots=True)
+class OtpEmailDelivery:
+    recipient: str
+    code: str
+    expires_at: datetime
+
+
 class OtpService:
     def __init__(self, db: AsyncSession, settings: Settings, email_sender: EmailSender) -> None:
         self.db = db
@@ -31,11 +39,12 @@ class OtpService:
         self.otps = OtpRepository(db)
         self.sessions = SessionRepository(db)
 
-    async def forgot_password(self, email: str) -> str:
+    async def forgot_password(self, email: str) -> OtpEmailDelivery | None:
         started = monotonic()
         code = generate_otp_code()
         code_hash = keyed_hash(code, self.settings, purpose="otp")
         user = await self.users.get_by_email(email)
+        delivery: OtpEmailDelivery | None = None
         if user is not None:
             now = utc_now()
             expires_at = now + timedelta(minutes=self.settings.otp_expiry_minutes)
@@ -47,28 +56,25 @@ class OtpService:
                 + timedelta(seconds=self.settings.otp_resend_cooldown_seconds),
             )
             await self.db.commit()
-            await self.email_sender.send_password_reset_otp(
-                recipient=user.email, code=code, expires_at=expires_at
+            delivery = OtpEmailDelivery(
+                recipient=user.email,
+                code=code,
+                expires_at=expires_at,
             )
-        remaining = MINIMUM_FORGOT_RESPONSE_SECONDS - (monotonic() - started)
-        if remaining > 0:
-            await asyncio.sleep(remaining)
-        return GENERIC_FORGOT_MESSAGE
+        await self._wait_for_generic_response_floor(started)
+        return delivery
 
-    async def resend(self, email: str) -> str:
+    async def resend(self, email: str) -> OtpEmailDelivery | None:
+        started = monotonic()
         user = await self.users.get_by_email(email)
         if user is None:
-            return GENERIC_FORGOT_MESSAGE
+            await self._wait_for_generic_response_floor(started)
+            return None
         now = utc_now()
         record = await self.otps.get_for_user(user.id, for_update=True)
         if record is not None and record.resend_available_at > now:
-            retry = max(1, int((record.resend_available_at - now).total_seconds()))
-            raise AppError(
-                429,
-                "otp_resend_cooldown",
-                "Please wait before requesting another code.",
-                headers={"Retry-After": str(retry)},
-            )
+            await self._wait_for_generic_response_floor(started)
+            return None
         code = generate_otp_code()
         expires_at = now + timedelta(minutes=self.settings.otp_expiry_minutes)
         await self.otps.issue(
@@ -78,10 +84,18 @@ class OtpService:
             resend_available_at=now + timedelta(seconds=self.settings.otp_resend_cooldown_seconds),
         )
         await self.db.commit()
-        await self.email_sender.send_password_reset_otp(
-            recipient=user.email, code=code, expires_at=expires_at
+        await self._wait_for_generic_response_floor(started)
+        return OtpEmailDelivery(
+            recipient=user.email,
+            code=code,
+            expires_at=expires_at,
         )
-        return GENERIC_FORGOT_MESSAGE
+
+    @staticmethod
+    async def _wait_for_generic_response_floor(started: float) -> None:
+        remaining = MINIMUM_FORGOT_RESPONSE_SECONDS - (monotonic() - started)
+        if remaining > 0:
+            await asyncio.sleep(remaining)
 
     async def verify(self, *, email: str, code: str) -> str:
         user = await self.users.get_by_email(email)
