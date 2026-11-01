@@ -4,6 +4,7 @@ from types import SimpleNamespace
 from typing import cast
 
 import pytest
+from conftest import clear_settings_environment
 from fastapi import FastAPI, Request
 from httpx import AsyncClient
 
@@ -85,6 +86,18 @@ def test_settings_keep_external_secrets_optional_and_tracing_off() -> None:
     assert settings.smtp_password is None
     assert settings.langsmith_api_key is None
     assert settings.langsmith_tracing is False
+
+
+def test_non_live_settings_ignore_a_developer_exported_qdrant_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("QDRANT_API_KEY", "developer-exported-placeholder")
+    assert Settings(_env_file=None, environment="test").qdrant_api_key is not None
+
+    clear_settings_environment(monkeypatch)
+    settings = Settings(_env_file=None, environment="test")
+
+    assert settings.qdrant_api_key is None
 
 
 def test_smtp_inconsistent_tls_and_missing_credentials_warn_at_startup(

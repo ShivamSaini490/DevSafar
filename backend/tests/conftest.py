@@ -17,10 +17,55 @@ from alembic import command
 
 os.environ["ENVIRONMENT"] = "test"
 
-from app.core.config import Settings  # noqa: E402
+from app.core.config import Settings, get_settings  # noqa: E402
 from app.db.session import create_db_engine, create_session_factory  # noqa: E402
 from app.schemas.trip import TripRequirements, TripResponse  # noqa: E402
 from app.utils.datetime_utils import INDIA_TIME_ZONE  # noqa: E402
+
+SETTINGS_ENVIRONMENT_VARIABLES = frozenset(
+    field_name.upper() for field_name in Settings.model_fields
+)
+LIVE_INTEGRATION_ENVIRONMENT_VARIABLES = frozenset(
+    {
+        "GROQ_API_KEY",
+        "QDRANT_API_KEY",
+        "QDRANT_URL",
+        "TAVILY_API_KEY",
+    }
+)
+
+
+def clear_settings_environment(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    preserve: frozenset[str] = frozenset(),
+) -> None:
+    """Remove Settings inputs while leaving pytest control variables untouched."""
+    for variable in SETTINGS_ENVIRONMENT_VARIABLES - preserve:
+        monkeypatch.delenv(variable, raising=False)
+
+
+@pytest.fixture(autouse=True)
+def isolate_settings_environment(
+    request: pytest.FixtureRequest,
+    monkeypatch: pytest.MonkeyPatch,
+) -> Iterator[None]:
+    preserve = (
+        LIVE_INTEGRATION_ENVIRONMENT_VARIABLES
+        if request.node.get_closest_marker("live") is not None
+        else frozenset()
+    )
+    clear_settings_environment(monkeypatch, preserve=preserve)
+    database_url = make_url(_test_database_url())
+    monkeypatch.setenv("ENVIRONMENT", "test")
+    monkeypatch.setenv("POSTGRES_HOST", database_url.host or "127.0.0.1")
+    monkeypatch.setenv("POSTGRES_PORT", str(database_url.port or 5432))
+    monkeypatch.setenv("POSTGRES_DB", database_url.database or "devsafar_test")
+    monkeypatch.setenv("POSTGRES_USER", database_url.username or "devsafar")
+    monkeypatch.setenv("POSTGRES_PASSWORD", database_url.password or "")
+    get_settings.cache_clear()
+    yield
+    get_settings.cache_clear()
 
 
 class FakeIntentModel:
@@ -99,6 +144,7 @@ def _settings() -> Settings:
     url = make_url(_test_database_url())
     return Settings(
         _env_file=None,
+        _env_prefix="DEVSAFAR_PYTEST_ISOLATED_",
         environment="test",
         debug=False,
         log_level="WARNING",

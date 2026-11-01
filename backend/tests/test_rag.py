@@ -4,11 +4,17 @@ import secrets
 from collections.abc import Sequence
 from datetime import date, datetime
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Any, cast
 from uuid import UUID, uuid4
 
 import pytest
 from conftest import FakeIntentModel
+from httpx import Headers
 from pydantic import SecretStr
+from qdrant_client import AsyncQdrantClient
+from qdrant_client.http import models
+from qdrant_client.http.exceptions import UnexpectedResponse
 
 from app.agents.graph import LangGraphTripPlanner
 from app.core.config import Settings
@@ -20,6 +26,7 @@ from app.rag.ingestion import (
 )
 from app.rag.retriever import RAG_QUERY_INTENT, RAGRetriever
 from app.rag.vector_store import (
+    FILTER_PAYLOAD_FIELDS,
     KnowledgePoint,
     KnowledgeVectorStore,
     QdrantVectorStore,
@@ -86,6 +93,218 @@ class FakeVectorStore(KnowledgeVectorStore):
         if self.fail_search is not None:
             raise self.fail_search
         return list(self.hits)
+
+
+class IndexEnforcingFakeQdrantClient:
+    """Small Qdrant double that rejects filtered calls without keyword indexes."""
+
+    def __init__(self) -> None:
+        self.indexes: set[str] = set()
+        self.operations: list[str] = []
+        self.filter_keys_used: set[str] = set()
+        self.points: dict[UUID, models.PointStruct] = {}
+
+    async def collection_exists(self, collection_name: str) -> bool:
+        del collection_name
+        self.operations.append("collection_exists")
+        return True
+
+    async def get_collection(self, collection_name: str) -> Any:
+        del collection_name
+        self.operations.append("get_collection")
+        return SimpleNamespace(
+            config=SimpleNamespace(
+                params=SimpleNamespace(
+                    vectors=models.VectorParams(
+                        size=3,
+                        distance=models.Distance.COSINE,
+                    )
+                )
+            )
+        )
+
+    async def create_payload_index(
+        self,
+        *,
+        collection_name: str,
+        field_name: str,
+        field_schema: models.PayloadSchemaType,
+        wait: bool,
+    ) -> None:
+        del collection_name
+        assert field_schema == models.PayloadSchemaType.KEYWORD
+        assert wait is True
+        self.operations.append(f"index:{field_name}")
+        self.indexes.add(field_name)
+
+    async def upsert(
+        self,
+        *,
+        collection_name: str,
+        points: list[models.PointStruct],
+        wait: bool,
+    ) -> None:
+        del collection_name
+        assert wait is True
+        self.operations.append("upsert")
+        for point in points:
+            assert isinstance(point.id, UUID)
+            self.points[point.id] = point
+
+    async def delete(
+        self,
+        *,
+        collection_name: str,
+        points_selector: models.FilterSelector,
+        wait: bool,
+    ) -> None:
+        del collection_name
+        assert wait is True
+        self.operations.append("delete")
+        query_filter = points_selector.filter
+        self._require_filter_indexes(query_filter)
+        file_path = _match_value(query_filter, "file_path")
+        retained_ids = {
+            point_id
+            for condition in query_filter.must_not or []
+            if isinstance(condition, models.HasIdCondition)
+            for point_id in condition.has_id
+        }
+        self.points = {
+            point_id: point
+            for point_id, point in self.points.items()
+            if point.payload is None
+            or point.payload.get("file_path") != file_path
+            or point_id in retained_ids
+        }
+
+    async def query_points(
+        self,
+        *,
+        collection_name: str,
+        query: list[float],
+        query_filter: models.Filter,
+        limit: int,
+        score_threshold: float,
+        with_payload: bool,
+        with_vectors: bool,
+    ) -> Any:
+        del collection_name, query, score_threshold
+        assert with_payload is True
+        assert with_vectors is False
+        self.operations.append("query_points")
+        self._require_filter_indexes(query_filter)
+        destination = _match_value(query_filter, "destination")
+        matches = [
+            SimpleNamespace(score=1.0, payload=point.payload)
+            for point in self.points.values()
+            if point.payload is not None
+            and point.payload.get("destination") == destination
+        ]
+        return SimpleNamespace(points=matches[:limit])
+
+    async def close(self) -> None:
+        return None
+
+    def _require_filter_indexes(self, query_filter: models.Filter) -> None:
+        keys = {
+            condition.key
+            for condition in query_filter.must or []
+            if isinstance(condition, models.FieldCondition)
+        }
+        self.filter_keys_used.update(keys)
+        missing = keys - self.indexes
+        if missing:
+            missing_field = sorted(missing)[0]
+            raise RuntimeError(f'Index required but not found for "{missing_field}"')
+
+
+def _match_value(query_filter: models.Filter, field_name: str) -> object:
+    for condition in query_filter.must or []:
+        if isinstance(condition, models.FieldCondition) and condition.key == field_name:
+            return cast(models.MatchValue, condition.match).value
+    raise AssertionError(f"Missing filter field: {field_name}")
+
+
+@pytest.mark.asyncio
+async def test_vector_store_indexes_every_declared_filter_field_before_use() -> None:
+    client = IndexEnforcingFakeQdrantClient()
+    store = QdrantVectorStore(
+        cast(AsyncQdrantClient, client),
+        collection_name="existing_collection_without_indexes",
+        vector_size=3,
+        timeout_seconds=1,
+    )
+    point = KnowledgePoint(
+        point_id=uuid4(),
+        vector=[1.0, 0.0, 0.0],
+        payload={
+            "file_path": "guide.md",
+            "destination": "Puducherry",
+            "source_url": "https://official.example/guide",
+            "text": "Verified test note.",
+        },
+    )
+
+    await store.replace_file_chunks(file_path="guide.md", points=[point])
+    hits = await store.search(
+        destination="Puducherry",
+        vector=[1.0, 0.0, 0.0],
+        top_k=3,
+        score_threshold=0.0,
+    )
+
+    assert set(FILTER_PAYLOAD_FIELDS) == {"file_path", "destination", "source_url"}
+    assert client.filter_keys_used <= set(FILTER_PAYLOAD_FIELDS)
+    assert client.indexes == set(FILTER_PAYLOAD_FIELDS)
+    assert len(hits) == 1
+    first_filtered_operation = min(
+        client.operations.index("delete"),
+        client.operations.index("query_points"),
+    )
+    assert all(
+        client.operations.index(f"index:{field_name}") < first_filtered_operation
+        for field_name in FILTER_PAYLOAD_FIELDS
+    )
+
+
+@pytest.mark.asyncio
+async def test_qdrant_http_error_log_has_status_and_redacted_message(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    api_key = "qdrant-unit-test-secret"
+
+    class FailingClient:
+        async def collection_exists(self, collection_name: str) -> bool:
+            del collection_name
+            raise UnexpectedResponse(
+                status_code=400,
+                reason_phrase="Bad Request",
+                content=f'api_key={api_key} Index required for "file_path"'.encode(),
+                headers=Headers(),
+            )
+
+    store = QdrantVectorStore(
+        cast(AsyncQdrantClient, FailingClient()),
+        collection_name="test_collection",
+        vector_size=3,
+        timeout_seconds=1,
+        redaction_secret_values=(api_key,),
+    )
+
+    with (
+        caplog.at_level(logging.WARNING, logger="app.rag.vector_store"),
+        pytest.raises(UnexpectedResponse),
+    ):
+        await store.ensure_collection()
+
+    records = [record for record in caplog.records if record.name == "app.rag.vector_store"]
+    assert len(records) == 2
+    assert all(record.error_type == "UnexpectedResponse" for record in records)
+    assert all(record.http_status == 400 for record in records)
+    assert all("[REDACTED]" in record.error_message for record in records)
+    assert api_key not in caplog.text
+    assert all(api_key not in str(record.__dict__) for record in records)
 
 
 def _document(
@@ -478,15 +697,44 @@ async def test_live_qdrant_rag_smoke(settings: Settings) -> None:
                 )
             ],
         )
-        result = await RAGRetriever(
-            embedder,
-            store,
-            top_k=1,
+        first_hits = await store.search(
+            destination="Smoke Test Destination",
+            vector=vector,
+            top_k=10,
             score_threshold=0.0,
-            timeout_seconds=configured.rag_timeout_seconds,
-        ).retrieve("Smoke Test Destination")
-        assert result.items
-        assert result.items[0].text == text
+        )
+        assert len(first_hits) == 1
+        assert first_hits[0].payload["text"] == text
+
+        replacement_text = "Replacement neutral content for the live RAG smoke test."
+        replacement_vector = (await embedder.embed_documents([replacement_text]))[0]
+        await store.replace_file_chunks(
+            file_path="live-smoke.md",
+            points=[
+                KnowledgePoint(
+                    point_id=uuid4(),
+                    vector=replacement_vector,
+                    payload={
+                        "file_path": "live-smoke.md",
+                        "chunk_index": 0,
+                        "destination": "Smoke Test Destination",
+                        "text": replacement_text,
+                        "title": "Replacement smoke-test content",
+                        "source_url": "https://example.com/devsafar-rag-smoke",
+                        "updated_at": date.today().isoformat(),
+                        "license_note": "Temporary test payload",
+                    },
+                )
+            ],
+        )
+        replacement_hits = await store.search(
+            destination="Smoke Test Destination",
+            vector=replacement_vector,
+            top_k=10,
+            score_threshold=0.0,
+        )
+        assert len(replacement_hits) == 1
+        assert replacement_hits[0].payload["text"] == replacement_text
     finally:
         try:
             await store.delete_collection()
