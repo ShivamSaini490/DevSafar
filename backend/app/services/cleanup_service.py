@@ -4,6 +4,7 @@ from datetime import datetime
 from typing import Any, cast
 from uuid import UUID
 
+from redis.asyncio import Redis
 from sqlalchemy import delete, func, select
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -13,6 +14,7 @@ from app.models.conversation import Conversation
 from app.models.itinerary import Itinerary
 from app.models.message import Message
 from app.models.trip import Trip
+from app.services.planning_service import PlanningStreamStore
 
 
 @dataclass(frozen=True, slots=True)
@@ -21,6 +23,7 @@ class CleanupCounts:
     messages: int = 0
     trips: int = 0
     itineraries: int = 0
+    redis_streams: int = 0
 
 
 async def _delete_trip_and_itinerary_dependencies(
@@ -49,8 +52,37 @@ async def _delete_future_langgraph_checkpoints(
 
 
 class CleanupService:
-    def __init__(self, db: AsyncSession) -> None:
+    def __init__(self, db: AsyncSession, *, redis: Redis | None = None) -> None:
         self.db = db
+        self.redis = redis
+
+    async def _delete_planning_streams(
+        self,
+        *,
+        conversation_ids: list[UUID],
+        trip_ids: list[UUID],
+    ) -> int:
+        if self.redis is None:
+            return 0
+        conversation_values = {str(value) for value in conversation_ids}
+        related_trip_ids = set(trip_ids)
+        async for metadata_key in self.redis.scan_iter(match="planning:metadata:*"):
+            metadata = await self.redis.hgetall(metadata_key)
+            if metadata.get("conversation_id") not in conversation_values:
+                continue
+            try:
+                related_trip_ids.add(UUID(cast(str, metadata["trip_id"])))
+            except (KeyError, ValueError):
+                await self.redis.delete(metadata_key)
+        deleted_streams = 0
+        for trip_id in related_trip_ids:
+            deleted = await self.redis.delete(
+                PlanningStreamStore.stream_key(trip_id),
+                PlanningStreamStore.metadata_key(trip_id),
+            )
+            if deleted:
+                deleted_streams += 1
+        return deleted_streams
 
     async def delete_expired_conversations(
         self, *, batch_size: int, now: datetime | None = None
@@ -60,7 +92,10 @@ class CleanupService:
         message_count = 0
         trip_count = 0
         itinerary_count = 0
+        redis_stream_count = 0
         while True:
+            ids: list[UUID] = []
+            trip_ids: list[UUID] = []
             async with self.db.begin():
                 ids = list(
                     (
@@ -75,6 +110,13 @@ class CleanupService:
                 )
                 if not ids:
                     break
+                trip_ids = list(
+                    (
+                        await self.db.scalars(
+                            select(Trip.id).where(Trip.conversation_id.in_(ids))
+                        )
+                    ).all()
+                )
                 batch_message_count = await self.db.scalar(
                     select(func.count(Message.id)).where(Message.conversation_id.in_(ids))
                 )
@@ -95,9 +137,14 @@ class CleanupService:
                 message_count += int(batch_message_count or 0)
                 trip_count += batch_trips
                 itinerary_count += batch_itineraries
+            redis_stream_count += await self._delete_planning_streams(
+                conversation_ids=ids,
+                trip_ids=trip_ids,
+            )
         return CleanupCounts(
             conversations=conversation_count,
             messages=message_count,
             trips=trip_count,
             itineraries=itinerary_count,
+            redis_streams=redis_stream_count,
         )

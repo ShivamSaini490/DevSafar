@@ -111,7 +111,7 @@ async def test_saved_async_stream_stages_resume_and_persists_result(
 
     stream = await client.get(body["events_url"])
     assert stream.status_code == 200
-    assert stream.headers["cache-control"] == "no-cache"
+    assert stream.headers["cache-control"] == "no-store"
     assert stream.headers["x-accel-buffering"] == "no"
     events = _sse_events(stream.text)
     progress = [event for _, event in events if event["event"] == "progress"]

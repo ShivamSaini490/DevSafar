@@ -44,6 +44,7 @@ async def _run(documents_dir: Path) -> IngestionStats:
     embedder = FastEmbedService(
         settings.embedding_model,
         load_timeout_seconds=settings.rag_model_load_timeout_seconds,
+        cache_dir=settings.embedding_cache_dir,
     )
     redis = create_redis_client(settings)
     store = QdrantVectorStore.from_settings(

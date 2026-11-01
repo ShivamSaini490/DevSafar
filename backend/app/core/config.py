@@ -40,6 +40,8 @@ class Settings(BaseSettings):
     access_token_minutes: int = Field(default=60, ge=5, le=1440)
     access_token_cookie_name: str = "access_token"
     csrf_cookie_name: str = "csrf_token"
+    cors_allowed_origins: str = "http://127.0.0.1:5173,http://localhost:5173"
+    max_request_body_bytes: int = Field(default=1_048_576, ge=8192, le=10_485_760)
 
     postgres_host: str = "127.0.0.1"
     postgres_port: int = Field(default=5432, ge=1, le=65535)
@@ -112,6 +114,7 @@ class Settings(BaseSettings):
         min_length=1,
         max_length=200,
     )
+    embedding_cache_dir: str | None = None
     rag_top_k: int = Field(default=3, ge=1, le=10)
     rag_score_threshold: float = Field(default=0.45, ge=0, le=1)
     rag_timeout_seconds: float = Field(default=8.0, gt=0, le=60)
@@ -192,6 +195,34 @@ class Settings(BaseSettings):
             allowed_hosts=frozenset({hostname}),
         )
 
+    @field_validator("cors_allowed_origins")
+    @classmethod
+    def validate_cors_allowed_origins(cls, value: str) -> str:
+        origins = tuple(item.strip().rstrip("/") for item in value.split(",") if item.strip())
+        if not origins:
+            raise ValueError("CORS_ALLOWED_ORIGINS must contain at least one origin")
+        for origin in origins:
+            parsed = urlsplit(origin)
+            if (
+                origin == "*"
+                or parsed.scheme not in {"http", "https"}
+                or not parsed.netloc
+                or parsed.path not in {"", "/"}
+                or parsed.query
+                or parsed.fragment
+                or parsed.username
+                or parsed.password
+            ):
+                raise ValueError("CORS_ALLOWED_ORIGINS must contain exact HTTP(S) origins")
+        return ",".join(dict.fromkeys(origins))
+
+    @field_validator("embedding_cache_dir")
+    @classmethod
+    def normalize_embedding_cache_dir(cls, value: str | None) -> str | None:
+        if value is None or not value.strip():
+            return None
+        return value.strip()
+
     @model_validator(mode="after")
     def validate_security_settings(self) -> "Settings":
         secret_is_missing = (
@@ -237,6 +268,10 @@ class Settings(BaseSettings):
     @property
     def booking_host_allowlist(self) -> frozenset[str]:
         return parse_host_allowlist(self.booking_allowed_hosts)
+
+    @property
+    def cors_origin_list(self) -> list[str]:
+        return self.cors_allowed_origins.split(",")
 
     @property
     def tavily_configured(self) -> bool:

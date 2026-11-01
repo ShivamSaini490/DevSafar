@@ -20,6 +20,7 @@ from qdrant_client.http import models
 from qdrant_client.http.exceptions import UnexpectedResponse
 from redis.asyncio import Redis
 
+import app.rag.embeddings as embeddings_module
 from app.agents.graph import LangGraphTripPlanner
 from app.core.config import Settings
 from app.rag.cache import (
@@ -463,6 +464,26 @@ def _hit(
             "updated_at": "2026-10-01",
         },
     )
+
+
+def test_fastembed_model_cache_directory_is_forwarded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, str | None] = {}
+    sentinel = object()
+
+    def fake_text_embedding(*, model_name: str, cache_dir: str | None) -> object:
+        captured.update(model_name=model_name, cache_dir=cache_dir)
+        return sentinel
+
+    monkeypatch.setattr(embeddings_module, "TextEmbedding", fake_text_embedding)
+    loaded = FastEmbedService._load_model_sync("test/model", "/var/cache/devsafar")
+
+    assert loaded is sentinel
+    assert captured == {
+        "model_name": "test/model",
+        "cache_dir": "/var/cache/devsafar",
+    }
 
 
 @pytest.mark.asyncio

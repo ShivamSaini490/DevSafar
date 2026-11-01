@@ -7,6 +7,8 @@ from uuid import uuid4
 
 import httpx
 from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from starlette.datastructures import MutableHeaders
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
@@ -30,8 +32,9 @@ logger = logging.getLogger(__name__)
 
 
 class RequestIdMiddleware:
-    def __init__(self, app: ASGIApp) -> None:
+    def __init__(self, app: ASGIApp, settings: Settings) -> None:
         self.app = app
+        self.settings = settings
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] != "http":
@@ -42,17 +45,53 @@ class RequestIdMiddleware:
         scope.setdefault("state", {})["request_id"] = request_id
         request_id_token = bind_request_id(request_id)
         response_started = False
+        path = str(scope.get("path", ""))
+
+        raw_content_length = next(
+            (
+                value
+                for name, value in scope.get("headers", [])
+                if name.lower() == b"content-length"
+            ),
+            None,
+        )
+        try:
+            content_length = int(raw_content_length) if raw_content_length is not None else 0
+        except ValueError:
+            content_length = 0
 
         async def send_with_request_id(message: Message) -> None:
             nonlocal response_started
             if message["type"] == "http.response.start":
                 response_started = True
                 headers = MutableHeaders(scope=message)
-                headers.append("X-Request-ID", request_id)
+                headers["X-Request-ID"] = request_id
+                headers["X-Content-Type-Options"] = "nosniff"
+                headers["Referrer-Policy"] = "no-referrer"
+                headers["X-Frame-Options"] = "DENY"
+                if path in {"/docs", "/redoc", "/openapi.json"}:
+                    headers["Content-Security-Policy"] = "frame-ancestors 'none'"
+                if path.startswith("/api/") or headers.get("content-type", "").startswith(
+                    "text/event-stream"
+                ):
+                    headers["Cache-Control"] = "no-store"
             await send(message)
 
         try:
-            await self.app(scope, receive, send_with_request_id)
+            if content_length > self.settings.max_request_body_bytes:
+                response = JSONResponse(
+                    status_code=413,
+                    content={
+                        "error": {
+                            "code": "request_body_too_large",
+                            "message": "Request body is too large.",
+                            "request_id": request_id,
+                        }
+                    },
+                )
+                await response(scope, receive, send_with_request_id)
+            else:
+                await self.app(scope, receive, send_with_request_id)
         except Exception as exc:
             if response_started:
                 raise
@@ -84,6 +123,7 @@ def _lifespan(settings: Settings) -> Callable[[FastAPI], AbstractAsyncContextMan
             rag_embedder = FastEmbedService(
                 settings.embedding_model,
                 load_timeout_seconds=settings.rag_model_load_timeout_seconds,
+                cache_dir=settings.embedding_cache_dir,
             )
             rag_warmup_task = rag_embedder.start_warmup()
             app.state.rag_embedder = rag_embedder
@@ -181,7 +221,7 @@ def _lifespan(settings: Settings) -> Callable[[FastAPI], AbstractAsyncContextMan
         cleanup_task: asyncio.Task[None] | None = None
         if settings.cleanup_enabled:
             cleanup_task = asyncio.create_task(
-                run_cleanup_loop(session_factory, settings),
+                run_cleanup_loop(session_factory, redis, settings),
                 name="expired-conversation-cleanup",
             )
 
@@ -227,7 +267,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         debug=app_settings.debug,
         lifespan=_lifespan(app_settings),
     )
-    application.add_middleware(RequestIdMiddleware)
+    application.add_middleware(
+        CORSMiddleware,
+        allow_origins=app_settings.cors_origin_list,
+        allow_credentials=True,
+        allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
+        allow_headers=["Content-Type", "X-CSRF-Token", "Last-Event-ID"],
+        expose_headers=["X-Request-ID", "Retry-After"],
+    )
+    application.add_middleware(RequestIdMiddleware, settings=app_settings)
     register_exception_handlers(application)
     application.include_router(api_router)
     return application

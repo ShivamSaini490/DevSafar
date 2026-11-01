@@ -1,4 +1,6 @@
 .env
+.env.*
+!.env.example
 .git
 .mypy_cache
 .pytest_cache
@@ -6,4 +8,11 @@
 .venv
 __pycache__
 *.py[cod]
+*.log
 tests
+tmp
+docs
+README.md
+pytest.ini
+pyproject.toml
+scripts/smoke_e2e.py

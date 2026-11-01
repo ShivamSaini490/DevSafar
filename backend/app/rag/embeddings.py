@@ -32,9 +32,16 @@ def embedding_dimension(model_name: str) -> int:
 class FastEmbedService:
     """One process-local FastEmbed model with a shared background load task."""
 
-    def __init__(self, model_name: str, *, load_timeout_seconds: float = 180.0) -> None:
+    def __init__(
+        self,
+        model_name: str,
+        *,
+        load_timeout_seconds: float = 180.0,
+        cache_dir: str | None = None,
+    ) -> None:
         self.model_name = model_name
         self.load_timeout_seconds = load_timeout_seconds
+        self.cache_dir = cache_dir
         self._dimension = embedding_dimension(model_name)
         self._model: TextEmbedding | None = None
         self._load_lock = asyncio.Lock()
@@ -92,10 +99,17 @@ class FastEmbedService:
             started_at = perf_counter()
             try:
                 async with asyncio.timeout(self.load_timeout_seconds):
-                    model = await asyncio.to_thread(
-                        self._load_model_sync,
-                        self.model_name,
-                    )
+                    if self.cache_dir is None:
+                        model = await asyncio.to_thread(
+                            self._load_model_sync,
+                            self.model_name,
+                        )
+                    else:
+                        model = await asyncio.to_thread(
+                            self._load_model_sync,
+                            self.model_name,
+                            self.cache_dir,
+                        )
             except TimeoutError:
                 self._state = "failed"
                 self._load_error_type = "TimeoutError"
@@ -123,8 +137,8 @@ class FastEmbedService:
             self._state = "ready"
 
     @staticmethod
-    def _load_model_sync(model_name: str) -> TextEmbedding:
-        return TextEmbedding(model_name=model_name)
+    def _load_model_sync(model_name: str, cache_dir: str | None = None) -> TextEmbedding:
+        return TextEmbedding(model_name=model_name, cache_dir=cache_dir)
 
     @staticmethod
     def _embed_documents_sync(

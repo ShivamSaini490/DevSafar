@@ -1,164 +1,206 @@
-# DevSafar Backend - Foundation + Auth/OTP + Chat Modes + LangGraph Slice
+# DevSafar Backend
 
-Python 3.12 FastAPI foundation with async PostgreSQL, Redis, versioned health routes,
-safe error responses, structured redacted logs, Docker, and tests.
+DevSafar is a Python 3.12 FastAPI service for authenticated saved chats, tab-bound
+temporary chats, LangGraph trip planning, source-aware travel results, Redis-backed
+limits/streams, and seven-day data retention.
 
-Auth uses Argon2id passwords and revocable, short-lived HS256 JWT sessions. The JWT is
-sent only in an HttpOnly SameSite=Lax cookie; authenticated writes also require the
-double-submit CSRF cookie/header pair. Password-reset OTPs and reset grants are stored
-only as keyed hashes. For local development, SMTP-less OTP delivery is skipped only when
-`ENVIRONMENT=development` and `DEV_OTP_EMAIL_FALLBACK_ENABLED=true`; the code is never logged.
-Forgot-password and resend delivery runs as a FastAPI background task after the generic
-response is sent. SMTP failures are warning-only and cannot change the public response.
+The architecture sources are [Backend.pdf](../docs/Backend.pdf),
+[Complete.pdf](../docs/Complete.pdf), and [Work Flow.pdf](../docs/Work%20Flow.pdf).
 
-For SMTP, `SMTP_USE_TLS=true` means implicit TLS and normally pairs with port 465.
-`SMTP_USE_TLS=false` means STARTTLS and normally pairs with port 587. Standard ports are
-always mapped safely (587 uses `start_tls=True, use_tls=False`; 465 uses
-`use_tls=True, start_tls=False`) and an inconsistent setting logs a startup warning.
-`SMTP_TIMEOUT_SECONDS` bounds connect and SMTP command waits. When using Gmail, enable
-2-Step Verification, set `SMTP_USERNAME` to the full Gmail address, and paste the Gmail
-app password into `SMTP_PASSWORD` without spaces.
+## Prerequisites
 
-Set a persistent, random `SECRET_KEY` in the local environment for stable development
-sessions. If it is absent only in `development`, the app generates a process-local key and
-logs a warning; all sessions then become invalid after restart. Staging and production
-still refuse to start without an explicitly configured key.
+- Python 3.12
+- PostgreSQL 16
+- Redis 7
+- Docker Compose v2 (optional)
 
-Saved conversations are available only to authenticated owners. Their expiry is fixed
-at creation time plus seven days and is never refreshed by activity; every chat and
-message query also rejects expired records before scheduled cleanup runs.
-
-Temporary chat stores only bounded Redis context for 30 minutes (refreshed per turn) and
-never creates PostgreSQL rows or LangSmith traces. On the first turn the API returns an
-opaque `temp_token` response field. The frontend must keep that token and its random
-`temp_session_id` only in tab memory and send both on later turns. A cookie is deliberately
-not used because cookies are shared across browser tabs; the Redis key is an HMAC of both
-values, and neither raw value is used as a key or logged. The endpoint returns the clearly
-labelled structured trip response from the same in-request graph. Temporary results and
-follow-up context stay only in bounded Redis state and never create trip or itinerary rows.
-
-The LangGraph vertical slice runs five nodes in-request: intent, provider research,
-deterministic planning, deterministic validation, and response. Groq is used only for
-structured intent extraction; dates, durations, budgets, totals, retries, and feasibility
-are calculated in Python. Maps, transport, and hotel fallbacks remain clearly labelled
-stubs and never emit `live_quote`. Configure `GROQ_MODEL`,
-`GROQ_TIMEOUT_SECONDS`, and `GRAPH_TIMEOUT_SECONDS` as needed. Missing or failed Groq
-configuration returns a public-safe `503` instead of an internal error.
-
-## Tavily attraction research and booking redirects
-
-Tavily is opt-in with `TAVILY_ENABLED=false` by default. When enabled, set
-`TAVILY_API_KEY` in the environment, keep `TAVILY_BASE_URL=https://api.tavily.com`, and
-allowlist that exact host with `TAVILY_ALLOWED_HOSTS`. DevSafar sends only a fixed query
-containing the destination city, uses Basic search (1 credit per search), caps cache
-misses with `TAVILY_MAX_SEARCHES_PER_TRIP` (default 2), and caches each city in Redis for
-`TAVILY_CACHE_TTL_SECONDS` (default seven days). Requests have a bounded timeout and at
-most one retry. Disabled service, exhausted credits, invalid data, or network failure
-falls back to labelled stub attractions without failing the trip.
-
-Tavily web text is treated only as untrusted data. Social/video results configured in
-`TAVILY_EXCLUDED_DOMAINS` are removed first. At most
-`TAVILY_SNIPPETS_FOR_EXTRACTION` results (default 4) are sent per city, each capped by
-`ATTRACTION_SNIPPET_MAX_CHARS` (default 700); duplicate and near-empty snippets are
-dropped. Groq structured output proposes named places and verbatim evidence; Python then requires
-the normalized name and evidence to exist in the same snippet, rejects page titles,
-deduplicates names, and caps results with `ATTRACTIONS_PER_DESTINATION` (default 6).
-Only the grounded place objects are cached (`v2` cache key), so a cache hit calls neither
-Tavily nor Groq. Failed research is never stored as a successful result; a separate
-`TAVILY_NEGATIVE_CACHE_TTL_SECONDS` cache (default 120 seconds) briefly prevents repeated
-provider hammering. Extraction failure or zero grounded results returns the labelled
-unknown fallback and marks the Tavily data source degraded.
-
-Attraction extraction uses `GROQ_EXTRACTION_MODEL`; leaving it empty reuses `GROQ_MODEL`.
-A smaller model can be selected because Python grounding rejects every place that is not
-literally supported by the supplied source text. A 429 response is retried at most once
-after its `Retry-After`, bounded by `GROQ_MAX_RETRY_WAIT_SECONDS` (default 8). A 400
-structured-output failure gets one JSON-object-mode retry followed by local Pydantic and
-Python grounding validation. Logs contain only safe diagnostics and external-call counts,
-never prompts, snippets, failed generations, or provider keys.
-
-Descriptions are built in Python from the grounded evidence sentence, stripped of HTML,
-Markdown, links, emoji, and excess whitespace, then limited to 200 characters. Fees and
-opening hours are parsed only from that same sentence; fees remain estimates tied to the
-grounding URL and are never live quotes. The frontend must render attraction names,
-categories, descriptions, and itinerary notes as plain text only, never as HTML or via an
-HTML-injection API.
-
-`booking_links` contains plain HTTPS search/main-page redirects for IRCTC, MakeMyTrip,
-redBus, Google Flights, and Booking.com. Transport links are grouped by `leg_index`;
-hotel links are grouped by `stay_index` and carry that stay city's check-in/check-out
-dates. No affiliate or invented route parameters are added. Every redirect host is checked
-against `BOOKING_ALLOWED_HOSTS`; opening one is not a confirmed booking and no price is
-implied. Flight links also tell the user to verify the nearest-airport availability.
-
-Road schedules start driving days at 06:00 India time. `MAX_DRIVING_HOURS_PER_DAY`
-limits cumulative driving time per calendar day, while `DRIVING_LATEST_ARRIVAL_HOUR`
-(default 21) is the clock cutoff. An en-route hotel is added only when a leg actually
-crosses an overnight rest boundary.
-
-Saved chat turns persist the strict `TripResponse` and a versioned itinerary in PostgreSQL.
-`GET /api/v1/trips/{trip_id}` enforces the same owner and unexpired-conversation rules as
-chat retrieval. The graph currently has no checkpointer; saved-only checkpointing is
-deferred, and temporary chats must never create checkpoints.
-
-Expired-chat cleanup runs from the FastAPI lifespan every 15 minutes by default. It can be
-configured with `CLEANUP_INTERVAL_SECONDS` and `CLEANUP_BATCH_SIZE`, or disabled with
-`CLEANUP_ENABLED=false` (the integration test app does this explicitly).
-
-## Local setup
-
-1. Copy `backend/.env.example` to a local, untracked `backend/.env` and replace the
-   placeholders. Settings load that exact backend path regardless of the shell's current
-   directory; exported environment variables take precedence.
-2. Start local dependencies from the repository root:
-
-   ```powershell
-   docker compose up -d postgres redis
-   ```
-
-3. From `backend/`, install the generated requirements and run the API:
-
-   ```powershell
-   python -m pip install -r requirements.txt
-   uvicorn app.main:app --reload
-   ```
-
-   Apply migrations before starting the API; tables are never created with `create_all`:
-
-   ```powershell
-   alembic upgrade head
-   ```
-
-4. Verify:
-
-   ```text
-   GET http://127.0.0.1:8000/api/v1/health
-   GET http://127.0.0.1:8000/api/v1/ready
-   ```
-
-`/health` proves the API process is alive. `/ready` returns ready only when PostgreSQL
-and Redis respond successfully. Groq, Qdrant, SMTP, and LangSmith are intentionally not
-part of readiness.
-
-## Quality checks
-
-Auth/OTP integration tests require a real PostgreSQL database named `devsafar_test`.
-Export `TEST_DATABASE_URL` in the test process; the test suite deliberately does not load
-`backend/.env`. `TEST_REDIS_URL` is optional and defaults to local Redis database 15.
+Do not commit local environment files or secrets. Copy the placeholder template and fill
+the local copy from a secrets manager or developer-only source:
 
 ```powershell
-ruff check .
-mypy app
-pytest
+Copy-Item .env.example .env
+docker compose -f ..\docker-compose.yml up -d postgres redis
+python -m venv .venv
+.venv\Scripts\python.exe -m pip install -r requirements.txt
 ```
 
-## Tracing and sensitive data
+The application reads `backend/.env` only outside tests. Exported environment variables
+take precedence. Staging and production refuse to start without `SECRET_KEY`.
 
-LangSmith tracing defaults to off and is enabled only when `LANGSMITH_TRACING=true`, a
-LangSmith key exists, and the run is a saved chat. Temporary execution explicitly disables
-tracing at graph invocation. Trace tags contain only `saved_chat`; metadata contains only
-the opaque conversation ID, while input/output masking hooks replace traced payloads.
-Application logs use the existing redaction rules and never include user prompts or raw
-secrets in planning-failure diagnostics.
+## Environment variables
 
-- .env.example must contain only empty or placeholder values. Never copy values from backend/.env.
+The table intentionally lists names only. `.env.example` contains safe placeholders and
+comments; real values belong outside version control.
+
+| Area | Variable names |
+|---|---|
+| Application | `APP_NAME`, `APP_VERSION`, `ENVIRONMENT`, `DEBUG`, `LOG_LEVEL`, `SECRET_KEY`, `ACCESS_TOKEN_MINUTES`, `ACCESS_TOKEN_COOKIE_NAME`, `CSRF_COOKIE_NAME`, `CORS_ALLOWED_ORIGINS`, `MAX_REQUEST_BODY_BYTES` |
+| PostgreSQL | `POSTGRES_HOST`, `POSTGRES_PORT`, `POSTGRES_DB`, `POSTGRES_USER`, `POSTGRES_PASSWORD` |
+| Redis | `REDIS_URL` |
+| Groq and graph | `GROQ_API_KEY`, `GROQ_MODEL`, `GROQ_EXTRACTION_MODEL`, `GROQ_EXTRACTION_FALLBACK_MODEL`, `GROQ_TIMEOUT_SECONDS`, `GROQ_MAX_RETRY_WAIT_SECONDS`, `GRAPH_TIMEOUT_SECONDS` |
+| Maps | `MAPS_PROVIDER`, `OSRM_BASE_URL`, `NOMINATIM_BASE_URL`, `NOMINATIM_USER_AGENT`, `NOMINATIM_COUNTRY_CODE`, `MAPS_ALLOWED_HOSTS`, `MAPS_HTTP_TIMEOUT_SECONDS`, `GEOCODE_CACHE_TTL_SECONDS` |
+| Tavily | `TAVILY_ENABLED`, `TAVILY_API_KEY`, `TAVILY_BASE_URL`, `TAVILY_ALLOWED_HOSTS`, `TAVILY_MAX_SEARCHES_PER_TRIP`, `TAVILY_CACHE_TTL_SECONDS`, `TAVILY_NEGATIVE_CACHE_TTL_SECONDS`, `TAVILY_TIMEOUT_SECONDS`, `TAVILY_SNIPPETS_FOR_EXTRACTION`, `ATTRACTION_SNIPPET_MAX_CHARS`, `TAVILY_EXCLUDED_DOMAINS`, `ATTRACTIONS_PER_DESTINATION` |
+| Planning rules | `BOOKING_ALLOWED_HOSTS`, `FUEL_COST_PER_KM`, `MAX_DRIVING_HOURS_PER_DAY`, `DRIVING_LATEST_ARRIVAL_HOUR`, `MIN_STAY_HOURS_PER_DESTINATION`, `FOOD_ESTIMATE_PER_DAY_PER_TRAVELER`, `BUDGET_BUFFER_PERCENT` |
+| RAG | `QDRANT_URL`, `QDRANT_API_KEY`, `QDRANT_COLLECTION`, `RAG_ENABLED`, `EMBEDDING_MODEL`, `EMBEDDING_CACHE_DIR`, `RAG_TOP_K`, `RAG_SCORE_THRESHOLD`, `RAG_TIMEOUT_SECONDS`, `RAG_MODEL_LOAD_TIMEOUT_SECONDS`, `RAG_CACHE_TTL_SECONDS` |
+| Email | `SMTP_HOST`, `SMTP_PORT`, `SMTP_USERNAME`, `SMTP_PASSWORD`, `SMTP_USE_TLS`, `SMTP_TIMEOUT_SECONDS`, `SMTP_FROM_EMAIL`, `DEV_OTP_EMAIL_FALLBACK_ENABLED` |
+| OTP | `OTP_EXPIRY_MINUTES`, `OTP_MAX_ATTEMPTS`, `OTP_RESEND_COOLDOWN_SECONDS`, `RESET_GRANT_EXPIRY_MINUTES` |
+| Login and OTP limits | `LOGIN_RATE_LIMIT_PER_IP`, `LOGIN_RATE_LIMIT_PER_EMAIL`, `LOGIN_RATE_LIMIT_WINDOW_SECONDS`, `OTP_REQUEST_RATE_LIMIT_PER_IP`, `OTP_REQUEST_RATE_LIMIT_PER_EMAIL`, `OTP_REQUEST_RATE_LIMIT_WINDOW_SECONDS`, `OTP_VERIFY_RATE_LIMIT_PER_IP`, `OTP_VERIFY_RATE_LIMIT_PER_EMAIL`, `OTP_VERIFY_RATE_LIMIT_WINDOW_SECONDS` |
+| Temporary chat | `TEMPORARY_CHAT_TTL_SECONDS`, `TEMPORARY_CHAT_MAX_MESSAGES`, `TEMPORARY_CHAT_MAX_BYTES`, `TEMPORARY_CHAT_RATE_LIMIT_PER_IP`, `TEMPORARY_CHAT_RATE_LIMIT_PER_SESSION`, `TEMPORARY_CHAT_RATE_LIMIT_WINDOW_SECONDS` |
+| Planning admission | `PLANNING_RUNS_PER_HOUR`, `PLANNING_RUNS_PER_DAY`, `PLANNING_RUNS_PER_HOUR_GUEST`, `PLANNING_RUNS_PER_TEMP_SESSION`, `PLANNING_MAX_CONCURRENT`, `PLANNING_STREAM_MAX_SECONDS`, `PLANNING_STREAM_TTL_SECONDS`, `PLANNING_STREAM_HEARTBEAT_SECONDS`, `GROQ_DAILY_CALL_BUDGET`, `TAVILY_DAILY_SEARCH_BUDGET` |
+| Cleanup | `CLEANUP_ENABLED`, `CLEANUP_INTERVAL_SECONDS`, `CLEANUP_BATCH_SIZE` |
+| Tracing | `LANGSMITH_TRACING`, `LANGSMITH_API_KEY`, `LANGSMITH_PROJECT`, `LANGSMITH_ENDPOINT` |
+| Compose-only | `DEVSAFAR_ENV_FILE`, `API_PORT`, `REDIS_PORT` |
+| Tests-only | `TEST_DATABASE_URL`, `TEST_REDIS_URL` |
+
+## Migrations and running the API
+
+Apply migrations before every application start:
+
+```powershell
+.venv\Scripts\alembic.exe upgrade head
+.venv\Scripts\uvicorn.exe app.main:app --host 127.0.0.1 --port 8000
+```
+
+Liveness is `GET /api/v1/health`. Readiness is `GET /api/v1/ready` and checks only
+PostgreSQL and Redis.
+
+The root Compose file keeps PostgreSQL and Redis as standalone defaults. The optional
+application profile builds the backend, waits for both dependencies to become healthy,
+runs Alembic, and then starts Uvicorn on loopback:
+
+```powershell
+docker compose -f ..\docker-compose.yml --profile app up --build
+```
+
+Set `DEVSAFAR_ENV_FILE` to an uncommitted env-file path when the default local path is not
+appropriate. The FastEmbed cache is a named volume. `EMBEDDING_CACHE_DIR` can point to a
+different mounted directory.
+
+## Tests and quality checks
+
+Tests require a real PostgreSQL database named exactly `devsafar_test` and a real Redis.
+They never load `backend/.env` and never mock authentication, ownership, rate-limit, or
+retention enforcement.
+
+```powershell
+$env:TEST_DATABASE_URL='postgresql+asyncpg://devsafar:replace-with-local-dev-password@127.0.0.1:5433/devsafar_test'
+$env:TEST_REDIS_URL='redis://127.0.0.1:6379/15'
+.venv\Scripts\ruff.exe check .
+.venv\Scripts\mypy.exe app
+.venv\Scripts\pytest.exe
+```
+
+The autouse fixture removes every application Settings environment variable before each
+non-live test and injects only isolated test configuration. A `live` test preserves only
+the explicitly supported live integration variables. This cleanup rule prevents developer
+shell exports from silently changing ordinary tests.
+
+External-service tests are opt-in:
+
+```powershell
+.venv\Scripts\pytest.exe -m live
+```
+
+Export only the provider variables needed by the selected live test. Never paste them into
+the repository, test output, or issue reports.
+
+## End-to-end smoke test
+
+Start a migrated API and run:
+
+```powershell
+.venv\Scripts\python.exe scripts\smoke_e2e.py
+.venv\Scripts\python.exe scripts\smoke_e2e.py --base-url http://127.0.0.1:8000
+```
+
+The script checks health/readiness, signup/login/profile, saved async SSE, stored trip
+retrieval, one sync plan, temporary async SSE, generic forgot-password behavior, logout,
+and account cleanup. It prints one `PASS` or `FAIL` per step, exits non-zero on failure,
+and never prints passwords, cookies, OTPs, or tokens. No live travel-provider key is
+required: stub or degraded `data_sources` are valid structural results.
+
+The smoke account is random and is deleted at the end, including on an earlier failure
+when authentication is still available.
+
+## RAG document ingestion
+
+Curated Markdown documents live in `app/rag/documents/`. Each non-example document must
+include the provenance front matter enforced by the ingestion code. Validate locally
+without embeddings or Qdrant writes:
+
+```powershell
+.venv\Scripts\python.exe scripts\ingest_knowledge.py --dry-run
+```
+
+After configuring Qdrant, Redis, and the embedding cache, ingest with:
+
+```powershell
+.venv\Scripts\python.exe scripts\ingest_knowledge.py
+```
+
+RAG content is untrusted context. It cannot override prompts or deterministic date,
+budget, route, or booking-link checks, and it must not claim live fares or availability.
+
+## Security model
+
+- Passwords use Argon2id. JWT access tokens contain `sid` and `jti`, are sent only in an
+  HttpOnly SameSite=Lax cookie, and are accepted only while the matching database session
+  remains active.
+- Authenticated writes use double-submit CSRF protection. Logout revokes the active
+  session; password change and password reset revoke every session.
+- OTP request/resend responses are generic. OTP verifiers and reset grants are keyed
+  hashes; attempts, expiry, cooldown, and single use are database-enforced.
+- Ownership and expiry are applied in repository queries. Cross-user and expired
+  conversations, trips, messages, and streams return 404 rather than revealing existence.
+- Temporary chat context is HMAC-bound to a random tab session plus token, stored only in
+  Redis with TTL, never persisted in PostgreSQL, and never traced to LangSmith.
+- Login, OTP, temporary-chat, saved/guest planning, per-user active-run, and global
+  concurrency limits are Redis-backed. Every 429 uses the standard error body and
+  `Retry-After`.
+- Request bodies and message lengths are bounded. Provider snippets and RAG chunks are
+  treated as data. Booking redirects must be HTTPS and match the exact host allowlist.
+- API responses use `nosniff`, no-referrer, anti-framing, and no-store headers. CORS uses
+  explicit origins with credentials and never allows `*`.
+- Structured logging redacts configured secrets, credentials, OTPs, JWTs, cookies, email
+  addresses, and connection URLs. User prompts are not logged.
+
+## Retention and cleanup
+
+Saved conversations have `expires_at = created_at + 7 days`; activity never extends it.
+Every read rejects expired data immediately. The cleanup loop deletes conversations,
+messages, trips, itinerary versions, and matching Redis planning streams in batches and is
+idempotent. Temporary chat and planning streams use Redis TTLs.
+
+Account deletion cascades through conversations, messages, trips, and itineraries.
+Deletion from the active database does not instantly remove retained backups; production
+backup expiry and purge procedures must match the published retention promise.
+
+## Known limitations
+
+- Hotel results are labelled stubs unless an approved provider is configured.
+- There are no fabricated live fares, room inventories, seat counts, or confirmed
+  bookings; unavailable prices remain unknown.
+- Current deterministic feasibility is road-focused. Non-road transport entries are
+  comparison/redirect metadata, not verified schedules.
+- The public OSRM demo server is testing-only and must not be treated as a production SLA.
+- Nominatim use must follow its usage policy, including an identifying user agent, caching,
+  low request volume, attribution, and migration to an approved production service when
+  traffic grows.
+- The LangGraph checkpointer remains deferred; saved results persist in application tables.
+
+## Deployment checklist
+
+- [ ] Terminate HTTPS at a trusted load balancer or reverse proxy; enable secure cookies.
+- [ ] Store all secrets in a managed secrets manager; keep env files out of images and Git.
+- [ ] Rotate `SECRET_KEY`, database, Redis, SMTP, Groq, Tavily, Qdrant, and LangSmith keys
+      through a rehearsed rotation procedure.
+- [ ] Put a WAF and rate-aware edge controls in front of the API.
+- [ ] Restrict database, Redis, Qdrant, and provider egress networking by least privilege.
+- [ ] Run Alembic before application rollout and use health/readiness gates.
+- [ ] Configure encrypted PostgreSQL backups, test restores, document backup retention,
+      and ensure expiry/purge timing matches the seven-day chat policy and account deletion
+      disclosures.
+- [ ] Persist and monitor the embedding cache volume; do not bake downloaded models or
+      secrets into the image.
+- [ ] Alert on readiness failures, authentication abuse, 429 spikes, cleanup failures,
+      provider degradation, and planning timeouts without logging sensitive payloads.
