@@ -9,6 +9,7 @@ if str(SCRIPT_BACKEND_ROOT) not in sys.path:
     sys.path.insert(0, str(SCRIPT_BACKEND_ROOT))
 
 from app.core.config import BACKEND_ROOT, get_settings  # noqa: E402
+from app.db.session import create_redis_client  # noqa: E402
 from app.rag.embeddings import FastEmbedService  # noqa: E402
 from app.rag.ingestion import (  # noqa: E402
     IngestionStats,
@@ -40,15 +41,25 @@ async def _run(documents_dir: Path) -> IngestionStats:
     settings = get_settings()
     if not settings.qdrant_url or settings.qdrant_api_key is None:
         raise SystemExit("Qdrant configuration is required for ingestion")
-    embedder = FastEmbedService(settings.embedding_model)
+    embedder = FastEmbedService(
+        settings.embedding_model,
+        load_timeout_seconds=settings.rag_model_load_timeout_seconds,
+    )
+    redis = create_redis_client(settings)
     store = QdrantVectorStore.from_settings(
         settings,
         vector_size=embedder.dimension,
     )
     try:
-        return await KnowledgeIngestor(embedder, store).ingest_directory(documents_dir)
+        return await KnowledgeIngestor(
+            embedder,
+            store,
+            redis=redis,
+            collection_name=settings.qdrant_collection,
+        ).ingest_directory(documents_dir)
     finally:
         await store.close()
+        await redis.aclose()
 
 
 def main() -> None:

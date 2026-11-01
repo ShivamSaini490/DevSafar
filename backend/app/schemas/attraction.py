@@ -25,6 +25,8 @@ AttractionCategory = Literal[
     "market",
     "palace",
     "memorial",
+    "bridge",
+    "ashram",
     "aquarium",
     "zoo",
     "other_named_place",
@@ -49,6 +51,8 @@ ATTRACTION_CATEGORIES = (
     "market",
     "palace",
     "memorial",
+    "bridge",
+    "ashram",
     "aquarium",
     "zoo",
     "other_named_place",
@@ -61,8 +65,13 @@ class AttractionCandidate(StrictSchema):
     evidence_quote: str = Field(min_length=2, max_length=1000)
 
 
+class AttractionExtractionCandidate(StrictSchema):
+    name: str = Field(min_length=2, max_length=120)
+    evidence_quote: str = Field(min_length=2, max_length=160)
+
+
 class AttractionExtraction(StrictSchema):
-    attractions: list[AttractionCandidate]
+    attractions: list[AttractionExtractionCandidate]
 
 
 class AttractionOption(StrictSchema):

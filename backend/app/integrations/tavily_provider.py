@@ -34,6 +34,7 @@ logger = logging.getLogger(__name__)
 MAX_RETRIES = 1
 RETRY_BACKOFF_SECONDS = 0.25
 MAX_RESULTS = 5
+TAVILY_ATTRACTION_CACHE_VERSION = "v3"
 
 _FEE_PATTERN = re.compile(
     r"(?:entry|entrance|admission|ticket)\s*(?:fee|price|cost)?\s*"
@@ -72,6 +73,10 @@ _INSTRUCTION_PHRASES = (
     "follow these instructions",
     "return fake",
     "call a tool",
+)
+_FIRST_PERSON_PATTERN = re.compile(
+    r"(?:^|[\s,;:.!?])(?:i|my|we|our)(?=$|[\s,;:.!?])|\bmy\s+top\b|\bi\s+recommend\b",
+    flags=re.IGNORECASE,
 )
 
 
@@ -389,6 +394,14 @@ class TavilyAttractionsProvider:
             if grounded is None:
                 continue
             snippet, evidence_sentence = grounded
+            snippet, evidence_sentence = self._neutral_description_evidence(
+                destination=destination,
+                name=name,
+                normalized_name=normalized_name,
+                grounded_snippet=snippet,
+                grounded_evidence=evidence_sentence,
+                snippets=snippets,
+            )
             description = self._clean_plain_text(
                 evidence_sentence,
                 limit=200,
@@ -458,6 +471,36 @@ class TavilyAttractionsProvider:
                 continue
             return snippet, evidence_quote.strip()
         return None
+
+    @classmethod
+    def _neutral_description_evidence(
+        cls,
+        *,
+        destination: str,
+        name: str,
+        normalized_name: str,
+        grounded_snippet: _SourceSnippet,
+        grounded_evidence: str,
+        snippets: list[_SourceSnippet],
+    ) -> tuple[_SourceSnippet, str]:
+        candidates = [(grounded_snippet, grounded_evidence)]
+        candidates.extend(
+            (snippet, sentence)
+            for snippet in snippets
+            for sentence in re.split(r"(?<=[.!?])\s+|[\r\n]+", snippet.content)
+            if sentence.strip() and sentence.strip() != grounded_evidence
+        )
+        for snippet, sentence in candidates:
+            cleaned = sentence.strip()
+            if normalized_name not in cls._normalize_for_grounding(cleaned):
+                continue
+            lowered = cleaned.casefold()
+            if any(phrase in lowered for phrase in _INSTRUCTION_PHRASES):
+                continue
+            if _FIRST_PERSON_PATTERN.search(cleaned):
+                continue
+            return snippet, cleaned
+        return grounded_snippet, f"{name} in {destination}."
 
     async def _read_cache(self, city: str) -> list[AttractionOption] | None:
         key = self._cache_key(city)
@@ -620,9 +663,12 @@ class TavilyAttractionsProvider:
     @staticmethod
     def _cache_key(city: str) -> str:
         digest = hashlib.sha256(city.casefold().strip().encode("utf-8")).hexdigest()
-        return f"devsafar:tavily:attractions:v2:{digest}"
+        return f"devsafar:tavily:attractions:{TAVILY_ATTRACTION_CACHE_VERSION}:{digest}"
 
     @staticmethod
     def _negative_cache_key(city: str) -> str:
         digest = hashlib.sha256(city.casefold().strip().encode("utf-8")).hexdigest()
-        return f"devsafar:tavily:attractions:v2:negative:{digest}"
+        return (
+            "devsafar:tavily:attractions:"
+            f"{TAVILY_ATTRACTION_CACHE_VERSION}:negative:{digest}"
+        )

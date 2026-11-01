@@ -78,20 +78,33 @@ def _lifespan(settings: Settings) -> Callable[[FastAPI], AbstractAsyncContextMan
         provider_http_client: httpx.AsyncClient | None = None
         attraction_extractor: GroqAttractionExtractor | None = None
         rag_store: QdrantVectorStore | None = None
+        rag_warmup_task: asyncio.Task[None] | None = None
+        rag_embedder: FastEmbedService | None = None
+        if settings.rag_enabled:
+            rag_embedder = FastEmbedService(
+                settings.embedding_model,
+                load_timeout_seconds=settings.rag_model_load_timeout_seconds,
+            )
+            rag_warmup_task = rag_embedder.start_warmup()
+            app.state.rag_embedder = rag_embedder
         if not hasattr(app.state, "trip_planner"):
             rag_retriever: RAGRetriever | None = None
             if settings.rag_configured:
-                embedder = FastEmbedService(settings.embedding_model)
+                assert rag_embedder is not None
                 rag_store = QdrantVectorStore.from_settings(
                     settings,
-                    vector_size=embedder.dimension,
+                    vector_size=rag_embedder.dimension,
                 )
                 rag_retriever = RAGRetriever(
-                    embedder,
+                    rag_embedder,
                     rag_store,
                     top_k=settings.rag_top_k,
                     score_threshold=settings.rag_score_threshold,
                     timeout_seconds=settings.rag_timeout_seconds,
+                    redis=redis,
+                    model_name=settings.embedding_model,
+                    collection_name=settings.qdrant_collection,
+                    cache_ttl_seconds=settings.rag_cache_ttl_seconds,
                 )
                 app.state.rag_store = rag_store
             if settings.maps_provider == "osm" or settings.tavily_configured:
@@ -181,6 +194,10 @@ def _lifespan(settings: Settings) -> Callable[[FastAPI], AbstractAsyncContextMan
                     await cleanup_task
             if provider_http_client is not None:
                 await provider_http_client.aclose()
+            if rag_warmup_task is not None and not rag_warmup_task.done():
+                rag_warmup_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await rag_warmup_task
             if rag_store is not None:
                 await rag_store.close()
             await redis.aclose()

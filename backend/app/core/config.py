@@ -52,6 +52,7 @@ class Settings(BaseSettings):
     groq_api_key: SecretStr | None = None
     groq_model: str = "llama-3.3-70b-versatile"
     groq_extraction_model: str = ""
+    groq_extraction_fallback_model: str = ""
     groq_timeout_seconds: float = Field(default=30.0, gt=0, le=60)
     groq_max_retry_wait_seconds: float = Field(default=8.0, ge=0, le=60)
     graph_timeout_seconds: float = Field(default=60.0, gt=0, le=180)
@@ -114,6 +115,8 @@ class Settings(BaseSettings):
     rag_top_k: int = Field(default=3, ge=1, le=10)
     rag_score_threshold: float = Field(default=0.45, ge=0, le=1)
     rag_timeout_seconds: float = Field(default=8.0, gt=0, le=60)
+    rag_model_load_timeout_seconds: float = Field(default=180.0, gt=0, le=600)
+    rag_cache_ttl_seconds: int = Field(default=3600, ge=60, le=86_400)
 
     smtp_host: str | None = None
     smtp_port: int = Field(default=587, ge=1, le=65535)
@@ -308,7 +311,21 @@ class Settings(BaseSettings):
 
     @property
     def groq_extraction_model_name(self) -> str:
-        return self.groq_extraction_model.strip() or self.groq_model
+        return self.groq_extraction_model_chain[0]
+
+    @property
+    def groq_extraction_fallback_model_name(self) -> str:
+        chain = self.groq_extraction_model_chain
+        return chain[1] if len(chain) > 1 else chain[0]
+
+    @property
+    def groq_extraction_model_chain(self) -> tuple[str, ...]:
+        candidates = (
+            self.groq_extraction_model.strip(),
+            self.groq_extraction_fallback_model.strip(),
+            self.groq_model.strip(),
+        )
+        return tuple(dict.fromkeys(model for model in candidates if model))
 
     @property
     def smtp_use_implicit_tls(self) -> bool:

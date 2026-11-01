@@ -1,9 +1,12 @@
+import asyncio
 import logging
 import os
 import secrets
+import threading
 from collections.abc import Sequence
 from datetime import date, datetime
 from pathlib import Path
+from time import perf_counter
 from types import SimpleNamespace
 from typing import Any, cast
 from uuid import UUID, uuid4
@@ -15,9 +18,15 @@ from pydantic import SecretStr
 from qdrant_client import AsyncQdrantClient
 from qdrant_client.http import models
 from qdrant_client.http.exceptions import UnexpectedResponse
+from redis.asyncio import Redis
 
 from app.agents.graph import LangGraphTripPlanner
 from app.core.config import Settings
+from app.rag.cache import (
+    RAG_QUERY_VECTOR_CACHE_TTL_SECONDS,
+    destination_tips_cache_key,
+    query_vector_cache_key,
+)
 from app.rag.embeddings import FastEmbedService
 from app.rag.ingestion import (
     KnowledgeDocumentError,
@@ -38,10 +47,14 @@ from app.utils.datetime_utils import INDIA_TIME_ZONE
 
 class FakeEmbedder:
     dimension = 3
+    model_name = "fake-multilingual-model"
+    state = "ready"
+    load_error_type: str | None = None
 
     def __init__(self) -> None:
         self.document_batches: list[list[str]] = []
         self.queries: list[str] = []
+        self.query_delay_seconds = 0.0
 
     async def embed_documents(self, texts: Sequence[str]) -> list[list[float]]:
         values = list(texts)
@@ -50,6 +63,8 @@ class FakeEmbedder:
 
     async def embed_query(self, text: str) -> list[float]:
         self.queries.append(text)
+        if self.query_delay_seconds:
+            await asyncio.sleep(self.query_delay_seconds)
         return [1.0, 0.0, 0.0]
 
 
@@ -61,6 +76,7 @@ class FakeVectorStore(KnowledgeVectorStore):
         self.ensure_calls = 0
         self.replace_calls = 0
         self.fail_search: Exception | None = None
+        self.search_delay_seconds = 0.0
 
     async def ensure_collection(self) -> None:
         self.ensure_calls += 1
@@ -90,9 +106,34 @@ class FakeVectorStore(KnowledgeVectorStore):
     ) -> list[VectorSearchHit]:
         del vector, top_k, score_threshold
         self.search_destinations.append(destination)
+        if self.search_delay_seconds:
+            await asyncio.sleep(self.search_delay_seconds)
         if self.fail_search is not None:
             raise self.fail_search
         return list(self.hits)
+
+
+class FakeRedis:
+    def __init__(self) -> None:
+        self.values: dict[str, str] = {}
+        self.expiries: dict[str, int] = {}
+        self.deleted: list[str] = []
+
+    async def get(self, key: str) -> str | None:
+        return self.values.get(key)
+
+    async def set(self, key: str, value: str, *, ex: int) -> bool:
+        self.values[key] = value
+        self.expiries[key] = ex
+        return True
+
+    async def delete(self, *keys: str) -> int:
+        self.deleted.extend(keys)
+        removed = sum(key in self.values for key in keys)
+        for key in keys:
+            self.values.pop(key, None)
+            self.expiries.pop(key, None)
+        return removed
 
 
 class IndexEnforcingFakeQdrantClient:
@@ -373,7 +414,20 @@ async def test_reingestion_is_idempotent_and_removes_stale_chunks(tmp_path: Path
     )
     embedder = FakeEmbedder()
     store = FakeVectorStore()
-    ingestor = KnowledgeIngestor(embedder, store, max_chars=120, overlap_chars=20)
+    redis = FakeRedis()
+    tips_key = destination_tips_cache_key(
+        collection_name="test_collection",
+        destination="Rameswaram",
+    )
+    redis.values[tips_key] = "cached stale tips"
+    ingestor = KnowledgeIngestor(
+        embedder,
+        store,
+        max_chars=120,
+        overlap_chars=20,
+        redis=cast(Redis, redis),
+        collection_name="test_collection",
+    )
 
     first = await ingestor.ingest_directory(tmp_path)
     first_ids = set(store.points)
@@ -382,6 +436,8 @@ async def test_reingestion_is_idempotent_and_removes_stale_chunks(tmp_path: Path
     assert first.documents == second.documents == 1
     assert first.chunks == second.chunks == 2
     assert set(store.points) == first_ids
+    assert tips_key in redis.deleted
+    assert tips_key not in redis.values
 
     path.write_text(_document(body="# First\nFirst verified note."), encoding="utf-8")
     third = await ingestor.ingest_directory(tmp_path)
@@ -407,6 +463,172 @@ def _hit(
             "updated_at": "2026-10-01",
         },
     )
+
+
+@pytest.mark.asyncio
+async def test_request_during_warmup_degrades_without_second_model_load(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    load_started = threading.Event()
+    release_load = threading.Event()
+    load_calls = 0
+
+    class FakeVector:
+        def tolist(self) -> list[float]:
+            return [1.0, 0.0, 0.0]
+
+    class FakeLoadedModel:
+        def query_embed(self, _text: str) -> list[FakeVector]:
+            return [FakeVector()]
+
+    def fake_load(_model_name: str) -> Any:
+        nonlocal load_calls
+        load_calls += 1
+        load_started.set()
+        release_load.wait(timeout=2)
+        return FakeLoadedModel()
+
+    monkeypatch.setattr(
+        FastEmbedService,
+        "_load_model_sync",
+        staticmethod(fake_load),
+    )
+    embedder = FastEmbedService(
+        "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
+        load_timeout_seconds=2,
+    )
+    first_task = embedder.start_warmup()
+    second_task = embedder.start_warmup()
+    assert first_task is second_task
+    assert await asyncio.to_thread(load_started.wait, 1)
+    store = FakeVectorStore([_hit(destination="Puducherry", score=0.95)])
+    retriever = RAGRetriever(
+        embedder,
+        store,
+        top_k=1,
+        score_threshold=0.5,
+        timeout_seconds=1,
+    )
+
+    started_at = perf_counter()
+    with caplog.at_level(logging.INFO):
+        warming_result = await retriever.retrieve("Puducherry")
+    elapsed = perf_counter() - started_at
+
+    assert warming_result.degraded
+    assert warming_result.items == []
+    assert elapsed < 0.1
+    assert store.search_destinations == []
+    assert load_calls == 1
+    assert "embedding model warming up" in caplog.text
+
+    release_load.set()
+    await first_task
+    assert embedder.state == "ready"
+    ready_result = await retriever.retrieve("Puducherry")
+    assert not ready_result.degraded
+    assert len(ready_result.items) == 1
+    assert load_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_embedding_model_load_timeout_logs_stage(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    def slow_load(_model_name: str) -> Any:
+        threading.Event().wait(0.05)
+        return object()
+
+    monkeypatch.setattr(
+        FastEmbedService,
+        "_load_model_sync",
+        staticmethod(slow_load),
+    )
+    embedder = FastEmbedService(
+        "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
+        load_timeout_seconds=0.01,
+    )
+
+    with caplog.at_level(logging.WARNING):
+        await embedder.start_warmup()
+
+    assert embedder.state == "failed"
+    record = next(
+        item for item in caplog.records if item.getMessage() == "RAG operation timed out"
+    )
+    assert record.stage == "model_load"
+    assert isinstance(record.elapsed_ms, int)
+
+
+@pytest.mark.parametrize("stage", ["embed", "qdrant_search"])
+@pytest.mark.asyncio
+async def test_rag_timeout_log_identifies_stage(
+    stage: str,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    embedder = FakeEmbedder()
+    store = FakeVectorStore([_hit(destination="Puducherry", score=0.95)])
+    if stage == "embed":
+        embedder.query_delay_seconds = 0.05
+    else:
+        store.search_delay_seconds = 0.05
+    retriever = RAGRetriever(
+        embedder,
+        store,
+        top_k=1,
+        score_threshold=0.5,
+        timeout_seconds=0.01,
+    )
+
+    with caplog.at_level(logging.WARNING):
+        result = await retriever.retrieve("Puducherry")
+
+    assert result.degraded
+    record = next(
+        item for item in caplog.records if item.getMessage() == "RAG operation timed out"
+    )
+    assert record.stage == stage
+    assert isinstance(record.elapsed_ms, int)
+    assert "Puducherry" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_query_vector_and_tips_caches_avoid_repeat_calls() -> None:
+    embedder = FakeEmbedder()
+    store = FakeVectorStore([_hit(destination="Puducherry", score=0.95)])
+    redis = FakeRedis()
+    retriever = RAGRetriever(
+        embedder,
+        store,
+        top_k=1,
+        score_threshold=0.5,
+        timeout_seconds=1,
+        redis=cast(Redis, redis),
+        model_name=embedder.model_name,
+        collection_name="test_collection",
+        cache_ttl_seconds=3600,
+    )
+
+    first = await retriever.retrieve("Pondicherry")
+    tips_key = destination_tips_cache_key(
+        collection_name="test_collection",
+        destination="Puducherry",
+    )
+    vector_key = query_vector_cache_key(
+        model_name=embedder.model_name,
+        destination="Puducherry",
+    )
+    await redis.delete(tips_key)
+    second = await retriever.retrieve("Puducherry")
+    third = await retriever.retrieve("Puducherry")
+
+    assert first.items == second.items == third.items
+    assert len(embedder.queries) == 1
+    assert store.search_destinations == ["Puducherry", "Puducherry"]
+    assert redis.expiries[vector_key] == RAG_QUERY_VECTOR_CACHE_TTL_SECONDS
+    assert redis.expiries[tips_key] == 3600
 
 
 @pytest.mark.asyncio

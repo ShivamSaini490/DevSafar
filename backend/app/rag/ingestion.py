@@ -1,11 +1,16 @@
 
 import hashlib
+import logging
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
 from uuid import UUID
 
+from redis.asyncio import Redis
+
+from app.core.logging import current_request_id
+from app.rag.cache import invalidate_destination_tips
 from app.rag.embeddings import EmbeddingProvider
 from app.rag.vector_store import KnowledgePoint, KnowledgeVectorStore
 from app.schemas.trip import canonical_place_name_for_comparison
@@ -18,6 +23,7 @@ REQUIRED_FRONT_MATTER = {
     "updated_at",
     "license_note",
 }
+logger = logging.getLogger(__name__)
 
 
 class KnowledgeDocumentError(ValueError):
@@ -155,11 +161,15 @@ class KnowledgeIngestor:
         *,
         max_chars: int = 900,
         overlap_chars: int = 120,
+        redis: Redis | None = None,
+        collection_name: str | None = None,
     ) -> None:
         self.embedder = embedder
         self.vector_store = vector_store
         self.max_chars = max_chars
         self.overlap_chars = overlap_chars
+        self.redis = redis
+        self.collection_name = collection_name
 
     async def ingest_directory(
         self,
@@ -191,7 +201,26 @@ class KnowledgeIngestor:
                 file_path=document.file_path,
                 points=points,
             )
+            await self._invalidate_destination_cache(document.destination)
         return stats
+
+    async def _invalidate_destination_cache(self, destination: str) -> None:
+        if self.redis is None or self.collection_name is None:
+            return
+        try:
+            await invalidate_destination_tips(
+                self.redis,
+                collection_name=self.collection_name,
+                destination=destination,
+            )
+        except Exception as exc:
+            logger.warning(
+                "RAG destination cache invalidation failed",
+                extra={
+                    "request_id": current_request_id(),
+                    "error_type": type(exc).__name__,
+                },
+            )
 
 
 def inspect_directory(

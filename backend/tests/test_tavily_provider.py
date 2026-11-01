@@ -12,12 +12,15 @@ from conftest import FakeIntentModel
 from pydantic import SecretStr
 
 from app.agents.graph import LangGraphTripPlanner
-from app.agents.llm import GroqAttractionExtractor
+from app.agents.llm import ATTRACTION_EXTRACTION_MAX_TOKENS, GroqAttractionExtractor
 from app.core.config import Settings
 from app.core.logging import bind_request_id, reset_request_id
 from app.db.session import create_redis_client
 from app.integrations.base import ProviderBundle
-from app.integrations.tavily_provider import TavilyAttractionsProvider
+from app.integrations.tavily_provider import (
+    TAVILY_ATTRACTION_CACHE_VERSION,
+    TavilyAttractionsProvider,
+)
 from app.schemas.attraction import AttractionOption
 from app.schemas.common import PriceQuote
 from app.schemas.trip import TripRequirements
@@ -103,7 +106,8 @@ def _candidate(
     evidence: str,
     category: str = "other_named_place",
 ) -> dict[str, str]:
-    return {"name": name, "category": category, "evidence_quote": evidence}
+    del category
+    return {"name": name, "evidence_quote": evidence}
 
 
 def _provider(
@@ -210,8 +214,11 @@ async def test_grounding_filters_titles_inventions_bad_quotes_and_injection(
         )
     )
     redis = create_redis_client(settings)
+    expanded_test_limit = settings.model_copy(
+        update={"attractions_per_destination": 8}
+    )
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        attractions = await _provider(settings, redis, client, groq).attractions(
+        attractions = await _provider(expanded_test_limit, redis, client, groq).attractions(
             _requirements("Puducherry")
         )
     await redis.aclose()
@@ -393,7 +400,7 @@ async def test_per_trip_search_cap_uses_fallback_without_extra_groq(
 
 
 @pytest.mark.asyncio
-async def test_old_v1_cache_is_ignored(settings: Settings) -> None:
+async def test_old_v2_cache_is_ignored(settings: Settings) -> None:
     old_title = AttractionOption(
         destination="Vijayawada",
         name="Tourism in Vijayawada - Wikipedia",
@@ -407,7 +414,7 @@ async def test_old_v1_cache_is_ignored(settings: Settings) -> None:
         fetched_at=FETCHED_AT,
     )
     digest = hashlib.sha256(b"vijayawada").hexdigest()
-    old_key = f"devsafar:tavily:attractions:v1:{digest}"
+    old_key = f"devsafar:tavily:attractions:v2:{digest}"
     sentence = "Bhavani Island is a visitor attraction in Vijayawada."
     tavily_calls = 0
 
@@ -634,10 +641,7 @@ async def test_groq_429_within_wait_bound_retries_once_and_succeeds(
     )
     assert record.http_status == 429
     assert record.groq_error_code == "rate_limit_exceeded"
-    assert record.groq_error_type == "tokens"
-    assert record.retry_after == "0.25"
-    assert record.rate_limit_reset_requests == "2s"
-    assert record.rate_limit_reset_units == "4s"
+    assert record.failed_generation_length == len("NEVER-LOG-FAILED-GENERATION")
     assert "NEVER-LOG-FAILED-GENERATION" not in caplog.text
     assert sentence not in caplog.text
 
@@ -721,6 +725,102 @@ async def test_groq_400_uses_exactly_one_json_object_retry(settings: Settings) -
     assert [item.name for item in result.candidates] == ["Kanaka Durga Temple"]
 
 
+class CountingGroqBudget:
+    def __init__(self, allowed_calls: int = 3) -> None:
+        self.allowed_calls = allowed_calls
+        self.services: list[str] = []
+
+    async def consume(self, service: str) -> bool:
+        self.services.append(service)
+        return len(self.services) <= self.allowed_calls
+
+
+@pytest.mark.asyncio
+async def test_double_json_validation_failure_uses_one_plain_text_json_fallback(
+    settings: Settings,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    sentence = "Ramanathaswamy Temple is a named place in Rameswaram."
+    failed_generation = "PRIVATE-FAILED-GENERATION-CONTENT"
+    primary = FakeAttractionCompletionClient(
+        FakeGroqHTTPError(
+            400,
+            code="json_validate_failed",
+            error_type="invalid_request_error",
+            failed_generation=failed_generation,
+        )
+    )
+    json_mode = FakeAttractionCompletionClient(
+        FakeGroqHTTPError(
+            400,
+            code="json_validate_failed",
+            error_type="invalid_request_error",
+            failed_generation=failed_generation,
+        )
+    )
+    plain = FakeAttractionCompletionClient(
+        "Model preface\n"
+        + json.dumps(_extraction(_candidate("Ramanathaswamy Temple", sentence)))
+        + "\nEnd of response"
+    )
+    budget = CountingGroqBudget()
+
+    with caplog.at_level(logging.WARNING):
+        result = await GroqAttractionExtractor(
+            _enabled_settings(settings),
+            client=primary,
+            json_client=json_mode,
+            plain_client=plain,
+            call_budget=budget,  # type: ignore[arg-type]
+        ).extract_attractions(city="Rameswaram", snippets=[sentence])
+
+    assert result.external_calls == 3
+    assert primary.calls == json_mode.calls == plain.calls == 1
+    assert budget.services == ["groq", "groq", "groq"]
+    assert result.candidates[0].category == "temple"
+    records = [
+        record
+        for record in caplog.records
+        if record.getMessage() == "Groq attraction extraction call failed"
+    ]
+    assert len(records) == 2
+    assert all(record.groq_error_code == "json_validate_failed" for record in records)
+    assert all(record.failed_generation_length == len(failed_generation) for record in records)
+    assert failed_generation not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_category_is_derived_and_place_count_is_capped(settings: Settings) -> None:
+    items = [
+        _candidate("Named Temple", "Named Temple is listed in the source."),
+        _candidate("River Bridge", "River Bridge is listed in the source."),
+        _candidate("Quiet Ashram", "Quiet Ashram is listed in the source."),
+        _candidate("City Museum", "City Museum is listed in the source."),
+        _candidate("Central Park", "Central Park is listed in the source."),
+        _candidate("Unknown Landmark", "Unknown Landmark is listed in the source."),
+        _candidate("Seventh Beach", "Seventh Beach is listed in the source."),
+    ]
+    budget = CountingGroqBudget()
+
+    result = await GroqAttractionExtractor(
+        _enabled_settings(settings),
+        client=FakeAttractionCompletionClient(_extraction(*items)),
+        call_budget=budget,  # type: ignore[arg-type]
+    ).extract_attractions(city="Test City", snippets=[item["evidence_quote"] for item in items])
+
+    assert len(result.candidates) == 6
+    assert [item.category for item in result.candidates] == [
+        "temple",
+        "bridge",
+        "ashram",
+        "museum",
+        "park",
+        "other_named_place",
+    ]
+    assert result.external_calls == 1
+    assert budget.services == ["groq"]
+
+
 @pytest.mark.asyncio
 async def test_failed_extraction_uses_negative_cache_not_result_cache(
     settings: Settings,
@@ -757,8 +857,9 @@ async def test_failed_extraction_uses_negative_cache_not_result_cache(
         second = await provider.attractions(_requirements("Puducherry"))
 
     digest = hashlib.sha256(b"puducherry").hexdigest()
-    assert await redis.get(f"devsafar:tavily:attractions:v2:{digest}") is None
-    assert await redis.get(f"devsafar:tavily:attractions:v2:negative:{digest}") == "1"
+    cache_prefix = f"devsafar:tavily:attractions:{TAVILY_ATTRACTION_CACHE_VERSION}"
+    assert await redis.get(f"{cache_prefix}:{digest}") is None
+    assert await redis.get(f"{cache_prefix}:negative:{digest}") == "1"
     await redis.aclose()
 
     assert tavily_calls == 1
@@ -806,8 +907,9 @@ async def test_negative_cache_expires_and_success_replaces_it(settings: Settings
         second = await provider.attractions(_requirements("Vijayawada"))
 
     digest = hashlib.sha256(b"vijayawada").hexdigest()
-    assert await redis.get(f"devsafar:tavily:attractions:v2:negative:{digest}") is None
-    assert await redis.get(f"devsafar:tavily:attractions:v2:{digest}") is not None
+    cache_prefix = f"devsafar:tavily:attractions:{TAVILY_ATTRACTION_CACHE_VERSION}"
+    assert await redis.get(f"{cache_prefix}:negative:{digest}") is None
+    assert await redis.get(f"{cache_prefix}:{digest}") is not None
     await redis.aclose()
 
     assert first[0].entry_fee.source == "stub"
@@ -899,6 +1001,7 @@ async def test_configured_extraction_model_is_used(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     built_models: list[str] = []
+    built_max_tokens: list[int | None] = []
     sentence = "Rock Beach is a named attraction in Puducherry."
     completion = FakeAttractionCompletionClient(
         _extraction(_candidate("Rock Beach", sentence, "beach"))
@@ -907,13 +1010,18 @@ async def test_configured_extraction_model_is_used(
     class FakeChatGroq:
         def __init__(self, **kwargs: Any) -> None:
             built_models.append(kwargs["model"])
+            built_max_tokens.append(kwargs.get("max_tokens"))
 
         def with_structured_output(self, *_args: Any, **_kwargs: Any) -> Any:
             return completion
 
     monkeypatch.setattr("app.agents.llm.ChatGroq", FakeChatGroq)
     enabled = _enabled_settings(settings).model_copy(
-        update={"groq_extraction_model": "llama-3.1-8b-instant"}
+        update={
+            "groq_extraction_model": "primary-extraction-model",
+            "groq_extraction_fallback_model": "fallback-extraction-model",
+            "groq_model": "base-model",
+        }
     )
 
     result = await GroqAttractionExtractor(enabled).extract_attractions(
@@ -922,7 +1030,14 @@ async def test_configured_extraction_model_is_used(
     )
 
     assert [item.name for item in result.candidates] == ["Rock Beach"]
-    assert built_models == ["llama-3.1-8b-instant"]
+    assert built_models == ["primary-extraction-model"]
+    assert built_max_tokens == [ATTRACTION_EXTRACTION_MAX_TOKENS]
+    assert enabled.groq_extraction_model_chain == (
+        "primary-extraction-model",
+        "fallback-extraction-model",
+        "base-model",
+    )
+    assert enabled.groq_extraction_fallback_model_name == "fallback-extraction-model"
 
 
 class DenyTavilyBudget:
@@ -985,10 +1100,59 @@ async def test_tavily_daily_budget_exhaustion_degrades_and_trip_completes(
 
 
 @pytest.mark.asyncio
+async def test_first_person_evidence_uses_neutral_sentence_or_template(
+    settings: Settings,
+) -> None:
+    personal_with_alternative = (
+        "I recommend Rock Beach for everyone. "
+        "Rock Beach is a named waterfront place in Puducherry."
+    )
+    personal_only = "My top Serenity Park is Serenity Park in Puducherry."
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json=_result_payload(
+                {
+                    "title": "Waterfront source",
+                    "url": "https://guide.example/rock-beach-neutral",
+                    "content": personal_with_alternative,
+                },
+                {
+                    "title": "Park source",
+                    "url": "https://guide.example/serenity-park",
+                    "content": personal_only,
+                },
+            ),
+        )
+
+    groq = FakeAttractionCompletionClient(
+        _extraction(
+            _candidate("Rock Beach", "I recommend Rock Beach for everyone."),
+            _candidate("Serenity Park", personal_only),
+        )
+    )
+    redis = create_redis_client(settings)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        attractions = await _provider(settings, redis, client, groq).attractions(
+            _requirements("Puducherry")
+        )
+    await redis.aclose()
+
+    descriptions = {item.name: item.description for item in attractions}
+    assert descriptions["Rock Beach"] == (
+        "Rock Beach is a named waterfront place in Puducherry."
+    )
+    assert descriptions["Serenity Park"] == "Serenity Park in Puducherry."
+    assert all(item.source_url is not None for item in attractions)
+
+
+@pytest.mark.asyncio
 async def test_description_truncates_on_word_boundary_with_ellipsis(
     settings: Settings,
 ) -> None:
     evidence = ("Rock Beach is " + ("a peaceful coastal promenade for visitors " * 8)).strip()
+    short_personal_quote = "I recommend Rock Beach."
 
     def handler(_request: httpx.Request) -> httpx.Response:
         return httpx.Response(
@@ -997,13 +1161,13 @@ async def test_description_truncates_on_word_boundary_with_ellipsis(
                 {
                     "title": "Puducherry guide",
                     "url": "https://guide.example/rock-beach-long",
-                    "content": evidence,
+                    "content": f"{short_personal_quote} {evidence}",
                 }
             ),
         )
 
     groq = FakeAttractionCompletionClient(
-        _extraction(_candidate("Rock Beach", evidence, "beach"))
+        _extraction(_candidate("Rock Beach", short_personal_quote, "beach"))
     )
     redis = create_redis_client(settings)
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:

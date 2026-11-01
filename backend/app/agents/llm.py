@@ -20,11 +20,11 @@ from app.agents.prompts import (
     INTENT_SYSTEM_PROMPT,
 )
 from app.core.config import Settings
-from app.core.logging import current_request_id, redact_sensitive_data
+from app.core.logging import redact_sensitive_data
 from app.core.rate_limiter import ExternalCallBudget
 from app.schemas.attraction import (
-    ATTRACTION_CATEGORIES,
     AttractionCandidate,
+    AttractionCategory,
     AttractionExtraction,
 )
 from app.schemas.trip import TripRequirements, TripResponse
@@ -84,30 +84,31 @@ _TRIP_REQUIREMENTS_OUTPUT_SCHEMA: dict[str, Any] = {
     ],
 }
 
-_ATTRACTION_OUTPUT_SCHEMA: dict[str, Any] = {
-    "title": "AttractionExtraction",
-    "type": "object",
-    "additionalProperties": False,
-    "properties": {
-        "attractions": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "additionalProperties": False,
-                "properties": {
-                    "name": {"type": "string"},
-                    "category": {
-                        "type": "string",
-                        "enum": list(ATTRACTION_CATEGORIES),
+ATTRACTION_EXTRACTION_MAX_TOKENS = 1200
+
+
+def _attraction_output_schema(max_places: int) -> dict[str, Any]:
+    return {
+        "title": "AttractionExtraction",
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "attractions": {
+                "type": "array",
+                "maxItems": max_places,
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "name": {"type": "string", "maxLength": 120},
+                        "evidence_quote": {"type": "string", "maxLength": 160},
                     },
-                    "evidence_quote": {"type": "string"},
+                    "required": ["name", "evidence_quote"],
                 },
-                "required": ["name", "category", "evidence_quote"],
-            },
-        }
-    },
-    "required": ["attractions"],
-}
+            }
+        },
+        "required": ["attractions"],
+    }
 
 
 class IntentModelFailure(Exception):
@@ -190,15 +191,19 @@ def _build_structured_client(
     *,
     model_name: str | None = None,
     force_json_object: bool = False,
+    max_tokens: int | None = None,
 ) -> IntentCompletionClient:
     assert settings.groq_api_key is not None
-    chat_model = ChatGroq(
-        model=model_name or settings.groq_model,
-        temperature=0,
-        api_key=settings.groq_api_key,
-        timeout=settings.groq_timeout_seconds,
-        max_retries=0,
-    )
+    client_options: dict[str, Any] = {
+        "model": model_name or settings.groq_model,
+        "temperature": 0,
+        "api_key": settings.groq_api_key,
+        "timeout": settings.groq_timeout_seconds,
+        "max_retries": 0,
+    }
+    if max_tokens is not None:
+        client_options["max_tokens"] = max_tokens
+    chat_model = ChatGroq(**client_options)
     if force_json_object:
         runnable = chat_model.with_structured_output(method="json_mode")
     elif (model_name or settings.groq_model) in _STRICT_JSON_SCHEMA_MODELS:
@@ -215,6 +220,26 @@ def _build_structured_client(
     return cast(IntentCompletionClient, runnable)
 
 
+def _build_plain_client(
+    settings: Settings,
+    *,
+    model_name: str,
+    max_tokens: int,
+) -> IntentCompletionClient:
+    assert settings.groq_api_key is not None
+    return cast(
+        IntentCompletionClient,
+        ChatGroq(
+            model=model_name,
+            temperature=0,
+            api_key=settings.groq_api_key,
+            timeout=settings.groq_timeout_seconds,
+            max_retries=0,
+            max_tokens=max_tokens,
+        ),
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class _GroqErrorDetails:
     error_type: str
@@ -224,6 +249,7 @@ class _GroqErrorDetails:
     retry_after: str | None
     rate_limit_reset_requests: str | None
     rate_limit_reset_tokens: str | None
+    failed_generation_length: int | None
 
 
 def _safe_header_value(value: Any) -> str | None:
@@ -282,6 +308,14 @@ def _groq_error_details(exc: BaseException) -> _GroqErrorDetails:
         retry_after=header("retry-after"),
         rate_limit_reset_requests=header("x-ratelimit-reset-requests"),
         rate_limit_reset_tokens=header("x-ratelimit-reset-tokens"),
+        failed_generation_length=(
+            len(failed_generation)
+            if isinstance(
+                failed_generation := error_body.get("failed_generation"),
+                str,
+            )
+            else None
+        ),
     )
 
 
@@ -305,23 +339,14 @@ def _retry_after_seconds(value: str | None) -> float | None:
 
 def _log_attraction_error(
     details: _GroqErrorDetails,
-    *,
-    retry_planned: bool,
-    retry_wait_seconds: float | None,
 ) -> None:
     logger.warning(
         "Groq attraction extraction call failed",
         extra={
-            "request_id": current_request_id(),
             "error_type": details.error_type,
             "http_status": details.http_status,
             "groq_error_code": details.provider_error_code,
-            "groq_error_type": details.provider_error_type,
-            "retry_after": details.retry_after,
-            "rate_limit_reset_requests": details.rate_limit_reset_requests,
-            "rate_limit_reset_units": details.rate_limit_reset_tokens,
-            "retry_planned": retry_planned,
-            "retry_wait_seconds": retry_wait_seconds,
+            "failed_generation_length": details.failed_generation_length,
         },
     )
 
@@ -667,28 +692,39 @@ class GroqAttractionExtractor:
         *,
         client: IntentCompletionClient | None = None,
         json_client: IntentCompletionClient | None = None,
+        plain_client: IntentCompletionClient | None = None,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         call_budget: ExternalCallBudget | None = None,
     ) -> None:
         self.settings = settings
         self._client = client
         self._json_client = json_client
+        self._plain_client = plain_client
         self._sleep = sleep
         self._call_budget = call_budget
 
     def _build_client(self) -> IntentCompletionClient:
         return _build_structured_client(
             self.settings,
-            _ATTRACTION_OUTPUT_SCHEMA,
+            _attraction_output_schema(self.settings.attractions_per_destination),
             model_name=self.settings.groq_extraction_model_name,
+            max_tokens=ATTRACTION_EXTRACTION_MAX_TOKENS,
         )
 
     def _build_json_client(self) -> IntentCompletionClient:
         return _build_structured_client(
             self.settings,
-            _ATTRACTION_OUTPUT_SCHEMA,
+            _attraction_output_schema(self.settings.attractions_per_destination),
             model_name=self.settings.groq_extraction_model_name,
             force_json_object=True,
+            max_tokens=ATTRACTION_EXTRACTION_MAX_TOKENS,
+        )
+
+    def _build_plain_client(self) -> IntentCompletionClient:
+        return _build_plain_client(
+            self.settings,
+            model_name=self.settings.groq_extraction_fallback_model_name,
+            max_tokens=ATTRACTION_EXTRACTION_MAX_TOKENS,
         )
 
     async def extract_attractions(
@@ -702,13 +738,15 @@ class GroqAttractionExtractor:
                 error_type="GroqConfigurationError",
             )
         schema_instruction = json.dumps(
-            _ATTRACTION_OUTPUT_SCHEMA,
+            _attraction_output_schema(self.settings.attractions_per_destination),
             separators=(",", ":"),
         )
         messages = [
             SystemMessage(
                 content=(
                     f"{ATTRACTION_EXTRACTION_SYSTEM_PROMPT}\n"
+                    f"Return at most {self.settings.attractions_per_destination} places. "
+                    "Each evidence_quote must be at most 160 characters.\n"
                     "Return JSON matching this schema exactly:\n"
                     f"{schema_instruction}"
                 )
@@ -724,59 +762,194 @@ class GroqAttractionExtractor:
                 )
             ),
         ]
-        model = self._client or self._build_client()
         external_calls = 0
-        last_details: _GroqErrorDetails | None = None
-        for attempt in range(2):
+
+        async def invoke(
+            model: IntentCompletionClient,
+            *,
+            plain_text: bool = False,
+        ) -> AttractionExtractionResult:
+            nonlocal external_calls
             if self._call_budget is not None and not await self._call_budget.consume("groq"):
                 raise AttractionExtractionFailure(
                     error_type="GroqDailyBudgetExhausted",
                     external_calls=external_calls,
                 )
+            external_calls += 1
+            result = await model.ainvoke(messages)
+            return _parse_attraction_extraction(
+                result,
+                external_calls=external_calls,
+                max_places=self.settings.attractions_per_destination,
+                plain_text=plain_text,
+            )
+
+        primary = self._client or self._build_client()
+        try:
+            return await invoke(primary)
+        except AttractionExtractionFailure:
+            raise
+        except Exception as first_exc:
+            first_details = _groq_error_details(first_exc)
+            _log_attraction_error(first_details)
+
+        if first_details.http_status == 429:
+            retry_wait_seconds = _retry_after_seconds(first_details.retry_after)
+            if (
+                retry_wait_seconds is None
+                or retry_wait_seconds > self.settings.groq_max_retry_wait_seconds
+            ):
+                raise _attraction_failure(first_details, external_calls)
+            if retry_wait_seconds:
+                await self._sleep(retry_wait_seconds)
             try:
-                external_calls += 1
-                result = await model.ainvoke(messages)
-                if isinstance(result, str):
-                    result = json.loads(result)
-                candidates = AttractionExtraction.model_validate(result).attractions
-                return AttractionExtractionResult(
-                    candidates=candidates,
-                    external_calls=external_calls,
-                )
-            except Exception as exc:
-                details = _groq_error_details(exc)
-                last_details = details
-                retry_wait_seconds: float | None = None
-                retry_planned = False
-                if attempt == 0 and details.http_status == 429:
-                    retry_wait_seconds = _retry_after_seconds(details.retry_after)
-                    retry_planned = (
-                        retry_wait_seconds is not None
-                        and retry_wait_seconds <= self.settings.groq_max_retry_wait_seconds
-                    )
-                elif attempt == 0 and details.http_status == 400:
-                    retry_planned = True
-                _log_attraction_error(
-                    details,
-                    retry_planned=retry_planned,
-                    retry_wait_seconds=retry_wait_seconds,
-                )
-                if not retry_planned:
-                    break
-                if details.http_status == 429:
-                    assert retry_wait_seconds is not None
-                    if retry_wait_seconds:
-                        await self._sleep(retry_wait_seconds)
-                else:
-                    model = self._json_client or self._build_json_client()
-        assert last_details is not None
-        raise AttractionExtractionFailure(
-            error_type=last_details.error_type,
-            http_status=last_details.http_status,
-            provider_error_code=last_details.provider_error_code,
-            provider_error_type=last_details.provider_error_type,
-            retry_after=last_details.retry_after,
-            rate_limit_reset_requests=last_details.rate_limit_reset_requests,
-            rate_limit_reset_tokens=last_details.rate_limit_reset_tokens,
-            external_calls=external_calls,
+                return await invoke(primary)
+            except AttractionExtractionFailure:
+                raise
+            except Exception as retry_exc:
+                retry_details = _groq_error_details(retry_exc)
+                _log_attraction_error(retry_details)
+                raise _attraction_failure(retry_details, external_calls) from retry_exc
+
+        if not _is_json_validation_failure(first_details):
+            raise _attraction_failure(first_details, external_calls)
+
+        json_model = self._json_client or self._build_json_client()
+        try:
+            return await invoke(json_model)
+        except AttractionExtractionFailure:
+            raise
+        except Exception as json_exc:
+            json_details = _groq_error_details(json_exc)
+            _log_attraction_error(json_details)
+            if not _is_json_validation_failure(json_details):
+                raise _attraction_failure(json_details, external_calls) from json_exc
+
+        plain_model = self._plain_client or self._build_plain_client()
+        try:
+            return await invoke(plain_model, plain_text=True)
+        except AttractionExtractionFailure:
+            raise
+        except Exception as plain_exc:
+            plain_details = _groq_error_details(plain_exc)
+            _log_attraction_error(plain_details)
+            raise _attraction_failure(plain_details, external_calls) from plain_exc
+
+
+def _is_json_validation_failure(details: _GroqErrorDetails) -> bool:
+    return details.http_status == 400 and details.provider_error_code == "json_validate_failed"
+
+
+def _attraction_failure(
+    details: _GroqErrorDetails,
+    external_calls: int,
+) -> AttractionExtractionFailure:
+    return AttractionExtractionFailure(
+        error_type=details.error_type,
+        http_status=details.http_status,
+        provider_error_code=details.provider_error_code,
+        provider_error_type=details.provider_error_type,
+        retry_after=details.retry_after,
+        rate_limit_reset_requests=details.rate_limit_reset_requests,
+        rate_limit_reset_tokens=details.rate_limit_reset_tokens,
+        external_calls=external_calls,
+    )
+
+
+def _parse_attraction_extraction(
+    result: Any,
+    *,
+    external_calls: int,
+    max_places: int,
+    plain_text: bool,
+) -> AttractionExtractionResult:
+    payload = _first_balanced_json_object(_message_text(result)) if plain_text else result
+    if isinstance(payload, BaseMessage):
+        payload = payload.content
+    if isinstance(payload, str):
+        payload = json.loads(payload)
+    extracted = AttractionExtraction.model_validate(payload)
+    candidates = [
+        AttractionCandidate(
+            name=item.name,
+            evidence_quote=item.evidence_quote,
+            category=derive_attraction_category(item.name),
         )
+        for item in extracted.attractions[:max_places]
+    ]
+    return AttractionExtractionResult(
+        candidates=candidates,
+        external_calls=external_calls,
+    )
+
+
+def derive_attraction_category(name: str) -> AttractionCategory:
+    category_keywords: tuple[tuple[AttractionCategory, tuple[str, ...]], ...] = (
+        ("temple", ("temple", "mandir")),
+        ("beach", ("beach",)),
+        ("fort", ("fort",)),
+        ("museum", ("museum",)),
+        ("park", ("park",)),
+        ("memorial", ("memorial",)),
+        ("bridge", ("bridge",)),
+        ("church", ("church", "cathedral", "basilica")),
+        ("lake", ("lake",)),
+        ("ashram", ("ashram",)),
+        ("mosque", ("mosque", "masjid")),
+        ("garden", ("garden",)),
+        ("island", ("island",)),
+        ("waterfall", ("waterfall", "falls")),
+        ("viewpoint", ("viewpoint", "view point")),
+        ("market", ("market", "bazaar")),
+        ("palace", ("palace",)),
+        ("aquarium", ("aquarium",)),
+        ("zoo", ("zoo",)),
+        ("monument", ("monument", "statue")),
+        ("heritage_site", ("heritage",)),
+    )
+    lowered = name.casefold()
+    for category, keywords in category_keywords:
+        if any(re.search(rf"\b{re.escape(keyword)}\b", lowered) for keyword in keywords):
+            return category
+    return "other_named_place"
+
+
+def _message_text(result: Any) -> str:
+    if isinstance(result, BaseMessage):
+        result = result.content
+    if not isinstance(result, str):
+        raise TypeError("Plain Groq attraction response must contain text")
+    return result
+
+
+def _first_balanced_json_object(text: str) -> dict[str, Any]:
+    start = text.find("{")
+    if start < 0:
+        raise json.JSONDecodeError("No JSON object found", text, 0)
+    depth = 0
+    in_string = False
+    escaped = False
+    for index in range(start, len(text)):
+        character = text[index]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == '"':
+                in_string = False
+            continue
+        if character == '"':
+            in_string = True
+        elif character == "{":
+            depth += 1
+        elif character == "}":
+            depth -= 1
+            if depth == 0:
+                candidate = text[start : index + 1]
+                candidate = re.sub(r",\s*([}\]])", r"\1", candidate)
+                payload = json.loads(candidate)
+                if not isinstance(payload, dict):
+                    raise TypeError("Groq attraction JSON must be an object")
+                return cast(dict[str, Any], payload)
+    raise json.JSONDecodeError("Unbalanced JSON object", text, start)

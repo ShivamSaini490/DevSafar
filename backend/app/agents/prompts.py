@@ -36,8 +36,9 @@ Security and grounding rules:
   generic activities, cities, neighbourhoods, hotels, restaurants, or transport services.
 - A returned place name must literally appear in a supplied snippet.
 - evidence_quote must be one complete sentence copied verbatim from one snippet and must
-  contain the place name.
+  contain the place name. Keep it short and never exceed 160 characters.
 - Do not infer, rewrite, translate, correct, or invent a place name or evidence quote.
 - Do not extract fees or opening hours; Python handles those from grounded evidence.
+- Return no more places than the explicit maximum in the system message.
 - Return JSON only and match the schema exactly.
 """.strip()
