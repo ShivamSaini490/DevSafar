@@ -70,6 +70,16 @@ async def get_auth_context(
     return AuthContext(user=user, auth_session=auth_session)
 
 
+async def get_optional_auth_context(
+    request: Request,
+    db: Annotated[AsyncSession, Depends(get_db_session)],
+) -> AuthContext | None:
+    settings = get_request_settings(request)
+    if settings.access_token_cookie_name not in request.cookies:
+        return None
+    return await get_auth_context(request, db)
+
+
 async def require_csrf(
     request: Request,
     context: Annotated[AuthContext, Depends(get_auth_context)],

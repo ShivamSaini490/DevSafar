@@ -1,4 +1,3 @@
-
 from datetime import datetime
 from typing import Literal
 from uuid import UUID
@@ -60,3 +59,17 @@ class TemporaryChatResponse(BaseModel):
     context_message_count: int
     expires_in_seconds: int
     trip: TripResponse
+
+
+class AsyncPlanningResponse(BaseModel):
+    user_message: MessageResponse
+    trip_id: UUID
+    status: Literal["running"] = "running"
+    events_url: str
+
+
+class TemporaryAsyncPlanningResponse(BaseModel):
+    temp_token: str | None = None
+    trip_id: UUID
+    status: Literal["running"] = "running"
+    events_url: str

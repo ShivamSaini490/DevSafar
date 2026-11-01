@@ -1,5 +1,4 @@
 from typing import Any
-from uuid import uuid4
 
 from app.agents.state import TravelState
 from app.core.config import Settings
@@ -25,9 +24,7 @@ def _ordered_warnings(
     errors: list[str],
     details: list[str],
 ) -> list[str]:
-    assumptions = [
-        warning for warning in details if warning.startswith(ASSUMPTION_PREFIXES)
-    ]
+    assumptions = [warning for warning in details if warning.startswith(ASSUMPTION_PREFIXES)]
     supporting_details = [
         warning for warning in details if not warning.startswith(ASSUMPTION_PREFIXES)
     ]
@@ -46,7 +43,7 @@ def build_response_node(settings: Settings) -> Any:
         warnings = _ordered_warnings(errors=errors, details=state["warnings"])
         status: TripStatus = "failed" if state["status"] == "failed" else "completed"
         response = TripResponse(
-            trip_id=uuid4(),
+            trip_id=state["trip_id"],
             status=status,
             requirements=requirements,
             feasible=state["feasible"],

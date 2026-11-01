@@ -1,3 +1,4 @@
+import re
 from datetime import date, datetime
 from decimal import Decimal
 from typing import Literal
@@ -21,6 +22,22 @@ def canonical_place_name(value: str) -> str:
     if cleaned.casefold() == "pondicherry":
         return "Puducherry"
     return cleaned
+
+
+def canonical_place_name_for_comparison(value: str) -> str:
+    cleaned = " ".join(value.split())
+    replacements = {
+        "pondicherry": "Puducherry",
+        "puducherry": "Puducherry",
+        "rameshwaram": "Rameswaram",
+        "rameswaram": "Rameswaram",
+    }
+    return re.sub(
+        r"\b(?:pondicherry|puducherry|rameshwaram|rameswaram)\b",
+        lambda match: replacements[match.group(0).casefold()],
+        cleaned,
+        flags=re.IGNORECASE,
+    )
 
 
 class TripRequirements(StrictSchema):

@@ -21,6 +21,7 @@ from app.agents.prompts import (
 )
 from app.core.config import Settings
 from app.core.logging import current_request_id, redact_sensitive_data
+from app.core.rate_limiter import ExternalCallBudget
 from app.schemas.attraction import (
     ATTRACTION_CATEGORIES,
     AttractionCandidate,
@@ -152,6 +153,10 @@ class AttractionExtractionFailure(Exception):
         self.rate_limit_reset_requests = rate_limit_reset_requests
         self.rate_limit_reset_tokens = rate_limit_reset_tokens
         self.external_calls = external_calls
+
+
+class IntentBudgetExhausted(Exception):
+    """The Redis-backed Groq intent budget rejected this external call."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -561,10 +566,12 @@ class GroqIntentModel:
         *,
         client: IntentCompletionClient | None = None,
         today_provider: Callable[[], date] = india_today,
+        call_budget: ExternalCallBudget | None = None,
     ) -> None:
         self.settings = settings
         self._client = client
         self._today_provider = today_provider
+        self._call_budget = call_budget
 
     def _build_client(self) -> IntentCompletionClient:
         return _build_structured_client(
@@ -609,6 +616,8 @@ class GroqIntentModel:
             ),
         ]
         for attempt in range(2):
+            if self._call_budget is not None and not await self._call_budget.consume("groq"):
+                raise IntentBudgetExhausted
             try:
                 result = await model.ainvoke(messages)
             except OutputParserException as exc:
@@ -659,11 +668,13 @@ class GroqAttractionExtractor:
         client: IntentCompletionClient | None = None,
         json_client: IntentCompletionClient | None = None,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        call_budget: ExternalCallBudget | None = None,
     ) -> None:
         self.settings = settings
         self._client = client
         self._json_client = json_client
         self._sleep = sleep
+        self._call_budget = call_budget
 
     def _build_client(self) -> IntentCompletionClient:
         return _build_structured_client(
@@ -717,6 +728,11 @@ class GroqAttractionExtractor:
         external_calls = 0
         last_details: _GroqErrorDetails | None = None
         for attempt in range(2):
+            if self._call_budget is not None and not await self._call_budget.consume("groq"):
+                raise AttractionExtractionFailure(
+                    error_type="GroqDailyBudgetExhausted",
+                    external_calls=external_calls,
+                )
             try:
                 external_calls += 1
                 result = await model.ainvoke(messages)

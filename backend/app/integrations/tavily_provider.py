@@ -20,9 +20,10 @@ from redis.asyncio import Redis
 from app.agents.llm import AttractionExtractionFailure, AttractionExtractor
 from app.core.config import Settings
 from app.core.logging import current_request_id
+from app.core.rate_limiter import ExternalCallBudget
 from app.schemas.attraction import AttractionCandidate, AttractionOption
 from app.schemas.common import PriceQuote
-from app.schemas.trip import TripRequirements
+from app.schemas.trip import TripRequirements, canonical_place_name_for_comparison
 from app.utils.url_validator import (
     validate_external_base_url,
     validate_public_https_url,
@@ -118,6 +119,7 @@ class TavilyAttractionsProvider:
         extractor: AttractionExtractor,
         client: httpx.AsyncClient | None = None,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        call_budget: ExternalCallBudget | None = None,
     ) -> None:
         self.settings = settings
         self.redis = redis
@@ -125,6 +127,8 @@ class TavilyAttractionsProvider:
         self.extractor = extractor
         self.client = client
         self._sleep = sleep
+        self._call_budget = call_budget
+        self.degradation_warnings: list[str] = []
         self._base_url = validate_external_base_url(
             settings.tavily_base_url,
             allowed_hosts=settings.tavily_host_allowlist,
@@ -132,6 +136,7 @@ class TavilyAttractionsProvider:
 
     async def attractions(self, requirements: TripRequirements) -> list[AttractionOption]:
         counts = _ExternalCallCounts()
+        self.degradation_warnings = []
         try:
             destinations = list(
                 dict.fromkeys(
@@ -179,6 +184,10 @@ class TavilyAttractionsProvider:
                     counts.groq_calls += extraction.external_calls
                 except AttractionExtractionFailure as exc:
                     counts.groq_calls += exc.external_calls
+                    if exc.error_type == "GroqDailyBudgetExhausted":
+                        self.degradation_warnings.append(
+                            "Attraction extraction is temporarily limited by the Groq daily budget."
+                        )
                     await self._write_negative_cache(destination)
                     attractions.append(self._fallback(destination))
                     continue
@@ -239,6 +248,11 @@ class TavilyAttractionsProvider:
         }
         calls = 0
         for attempt in range(MAX_RETRIES + 1):
+            if self._call_budget is not None and not await self._call_budget.consume("tavily"):
+                self.degradation_warnings.append(
+                    "Attraction research is temporarily limited by the Tavily daily budget."
+                )
+                return None, calls
             try:
                 calls += 1
                 response = await self._send(headers=headers, body=body)
@@ -375,7 +389,11 @@ class TavilyAttractionsProvider:
             if grounded is None:
                 continue
             snippet, evidence_sentence = grounded
-            description = self._clean_plain_text(evidence_sentence, limit=200)
+            description = self._clean_plain_text(
+                evidence_sentence,
+                limit=200,
+                ellipsis_when_truncated=True,
+            )
             if not description:
                 continue
             amount = self._parse_fee(evidence_sentence)
@@ -517,7 +535,12 @@ class TavilyAttractionsProvider:
         )
 
     @staticmethod
-    def _clean_plain_text(value: str, *, limit: int) -> str:
+    def _clean_plain_text(
+        value: str,
+        *,
+        limit: int,
+        ellipsis_when_truncated: bool = False,
+    ) -> str:
         cleaned = html.unescape(value.replace("\x00", " "))
         cleaned = _MARKDOWN_IMAGE_PATTERN.sub(r"\1", cleaned)
         cleaned = _MARKDOWN_LINK_PATTERN.sub(r"\1", cleaned)
@@ -531,12 +554,23 @@ class TavilyAttractionsProvider:
         )
         cleaned = " ".join(cleaned.split())
         cleaned = re.sub(r"\s+([.,;:!?])", r"\1", cleaned)
-        return cleaned[:limit].strip()
+        if len(cleaned) <= limit:
+            return cleaned
+        if not ellipsis_when_truncated:
+            return cleaned[:limit].strip()
+        prefix = cleaned[: limit - 1].rstrip()
+        if " " in prefix:
+            prefix = prefix.rsplit(" ", 1)[0]
+        return f"{prefix.rstrip()}…"
 
     @staticmethod
     def _normalize_for_grounding(value: str) -> str:
         return "".join(
-            character for character in html.unescape(value).casefold() if character.isalnum()
+            character
+            for character in canonical_place_name_for_comparison(
+                html.unescape(value)
+            ).casefold()
+            if character.isalnum()
         )
 
     @staticmethod

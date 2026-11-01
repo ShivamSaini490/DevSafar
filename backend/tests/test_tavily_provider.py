@@ -925,6 +925,144 @@ async def test_configured_extraction_model_is_used(
     assert built_models == ["llama-3.1-8b-instant"]
 
 
+class DenyTavilyBudget:
+    async def consume(self, service: str) -> bool:
+        assert service == "tavily"
+        return False
+
+
+@pytest.mark.asyncio
+async def test_tavily_daily_budget_exhaustion_degrades_and_trip_completes(
+    settings: Settings,
+    fake_intent_model: FakeIntentModel,
+) -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        raise AssertionError("Tavily must not be called after budget exhaustion")
+
+    groq = FakeAttractionCompletionClient(
+        AssertionError("Groq must not run without Tavily snippets")
+    )
+    enabled = _enabled_settings(settings)
+    redis = create_redis_client(settings)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+
+        def provider_factory(fetched_at: datetime) -> ProviderBundle:
+            return ProviderBundle.stubs(fetched_at).with_places(
+                TavilyAttractionsProvider(
+                    enabled,
+                    redis,
+                    fetched_at=fetched_at,
+                    extractor=GroqAttractionExtractor(enabled, client=groq),
+                    client=client,
+                    call_budget=DenyTavilyBudget(),  # type: ignore[arg-type]
+                ),
+                source_name="tavily",
+            )
+
+        response = await LangGraphTripPlanner(
+            enabled,
+            intent_model=fake_intent_model,
+            provider_factory=provider_factory,
+            now_provider=lambda: FETCHED_AT,
+        ).run(
+            conversation_id=None,
+            user_prompt="budget fallback test",
+            previous_trip=None,
+            chat_mode="temporary",
+        )
+    await redis.aclose()
+
+    assert response.status == "completed"
+    assert response.attractions
+    assert all(item.entry_fee.source == "stub" for item in response.attractions)
+    source = next(item for item in response.data_sources if item.name == "tavily")
+    assert source.status == "degraded"
+    assert (
+        "Attraction research is temporarily limited by the Tavily daily budget."
+        in response.warnings
+    )
+    assert groq.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_description_truncates_on_word_boundary_with_ellipsis(
+    settings: Settings,
+) -> None:
+    evidence = ("Rock Beach is " + ("a peaceful coastal promenade for visitors " * 8)).strip()
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json=_result_payload(
+                {
+                    "title": "Puducherry guide",
+                    "url": "https://guide.example/rock-beach-long",
+                    "content": evidence,
+                }
+            ),
+        )
+
+    groq = FakeAttractionCompletionClient(
+        _extraction(_candidate("Rock Beach", evidence, "beach"))
+    )
+    redis = create_redis_client(settings)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        attraction = (
+            await _provider(settings, redis, client, groq).attractions(
+                _requirements("Puducherry")
+            )
+        )[0]
+    await redis.aclose()
+
+    assert len(attraction.description) <= 200
+    assert attraction.description.endswith("…")
+    assert not attraction.description.endswith(" …")
+    truncated = attraction.description[:-1]
+    assert evidence.startswith(truncated)
+    assert evidence[len(truncated)] == " "
+
+
+@pytest.mark.asyncio
+async def test_destination_spelling_variants_dedupe_inside_place_names(
+    settings: Settings,
+) -> None:
+    first = "Rameshwaram Temple is a named temple near the coast."
+    second = "Rameswaram Temple is a named temple visited by pilgrims."
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json=_result_payload(
+                {
+                    "title": "Temple guide one",
+                    "url": "https://one.example/rameshwaram-temple",
+                    "content": first,
+                },
+                {
+                    "title": "Temple guide two",
+                    "url": "https://two.example/rameswaram-temple",
+                    "content": second,
+                },
+            ),
+        )
+
+    groq = FakeAttractionCompletionClient(
+        _extraction(
+            _candidate("Rameshwaram Temple", first, "temple"),
+            _candidate("Rameswaram Temple", second, "temple"),
+        )
+    )
+    redis = create_redis_client(settings)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        attractions = await _provider(settings, redis, client, groq).attractions(
+            _requirements("Rameswaram")
+        )
+    await redis.aclose()
+
+    assert len(attractions) == 1
+    assert attractions[0].name == "Rameshwaram Temple"
+
+
 @pytest.mark.live
 @pytest.mark.asyncio
 async def test_live_tavily_one_city(settings: Settings) -> None:

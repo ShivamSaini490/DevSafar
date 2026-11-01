@@ -16,6 +16,7 @@ from app.api.router import api_router
 from app.core.config import Settings, get_settings
 from app.core.exceptions import handle_unexpected_exception, register_exception_handlers
 from app.core.logging import bind_request_id, configure_logging, reset_request_id
+from app.core.rate_limiter import RedisExternalCallBudget
 from app.db.session import create_db_engine, create_redis_client, create_session_factory
 from app.integrations.base import ProviderBundle
 from app.integrations.maps_provider import OsmMapsProvider
@@ -69,13 +70,18 @@ def _lifespan(settings: Settings) -> Callable[[FastAPI], AbstractAsyncContextMan
         session_factory = create_session_factory(engine)
         app.state.db_session_factory = session_factory
         app.state.redis = redis
+        external_call_budget = RedisExternalCallBudget(redis, settings)
+        app.state.external_call_budget = external_call_budget
         provider_http_client: httpx.AsyncClient | None = None
         attraction_extractor: GroqAttractionExtractor | None = None
         if not hasattr(app.state, "trip_planner"):
             if settings.maps_provider == "osm" or settings.tavily_configured:
                 provider_http_client = httpx.AsyncClient()
             if settings.tavily_configured:
-                attraction_extractor = GroqAttractionExtractor(settings)
+                attraction_extractor = GroqAttractionExtractor(
+                    settings,
+                    call_budget=external_call_budget,
+                )
 
             if settings.maps_provider == "osm":
                 assert provider_http_client is not None
@@ -99,6 +105,7 @@ def _lifespan(settings: Settings) -> Callable[[FastAPI], AbstractAsyncContextMan
                                 fetched_at=fetched_at,
                                 extractor=attraction_extractor,
                                 client=provider_http_client,
+                                call_budget=external_call_budget,
                             ),
                             source_name="tavily",
                         )
@@ -107,6 +114,7 @@ def _lifespan(settings: Settings) -> Callable[[FastAPI], AbstractAsyncContextMan
                 app.state.trip_planner = LangGraphTripPlanner(
                     settings,
                     provider_factory=provider_factory,
+                    call_budget=external_call_budget,
                 )
             elif settings.tavily_configured:
                 assert provider_http_client is not None
@@ -120,6 +128,7 @@ def _lifespan(settings: Settings) -> Callable[[FastAPI], AbstractAsyncContextMan
                             fetched_at=fetched_at,
                             extractor=attraction_extractor,
                             client=provider_http_client,
+                            call_budget=external_call_budget,
                         ),
                         source_name="tavily",
                     )
@@ -127,9 +136,13 @@ def _lifespan(settings: Settings) -> Callable[[FastAPI], AbstractAsyncContextMan
                 app.state.trip_planner = LangGraphTripPlanner(
                     settings,
                     provider_factory=tavily_provider_factory,
+                    call_budget=external_call_budget,
                 )
             else:
-                app.state.trip_planner = LangGraphTripPlanner(settings)
+                app.state.trip_planner = LangGraphTripPlanner(
+                    settings,
+                    call_budget=external_call_budget,
+                )
         cleanup_task: asyncio.Task[None] | None = None
         if settings.cleanup_enabled:
             cleanup_task = asyncio.create_task(

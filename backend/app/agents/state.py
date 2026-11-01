@@ -12,6 +12,7 @@ from app.schemas.trip import TripRequirements, TripResponse, TripStatus
 
 
 class TravelState(TypedDict):
+    trip_id: UUID
     conversation_id: UUID | None
     user_prompt: str
     requirements: TripRequirements | None

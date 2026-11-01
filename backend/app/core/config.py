@@ -132,6 +132,17 @@ class Settings(BaseSettings):
     temporary_chat_rate_limit_per_session: int = Field(default=20, ge=1)
     temporary_chat_rate_limit_window_seconds: int = Field(default=60, ge=1)
 
+    planning_runs_per_hour: int = Field(default=10, ge=1)
+    planning_runs_per_day: int = Field(default=40, ge=1)
+    planning_runs_per_hour_guest: int = Field(default=5, ge=1)
+    planning_runs_per_temp_session: int = Field(default=10, ge=1)
+    planning_max_concurrent: int = Field(default=3, ge=1, le=100)
+    planning_stream_max_seconds: int = Field(default=120, ge=1, le=600)
+    planning_stream_ttl_seconds: int = Field(default=600, ge=60, le=3600)
+    planning_stream_heartbeat_seconds: int = Field(default=15, ge=1, le=60)
+    groq_daily_call_budget: int = Field(default=1000, ge=0)
+    tavily_daily_search_budget: int = Field(default=200, ge=0)
+
     cleanup_enabled: bool = True
     cleanup_interval_seconds: int = Field(default=900, ge=1)
     cleanup_batch_size: int = Field(default=100, ge=1, le=1000)

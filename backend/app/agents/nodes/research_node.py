@@ -1,4 +1,3 @@
-
 import asyncio
 from collections.abc import Callable
 from datetime import datetime
@@ -23,19 +22,19 @@ def build_research_node(
             providers.hotels.options(requirements),
             providers.places.attractions(requirements),
         )
+        provider_warnings = list(getattr(providers.places, "degradation_warnings", ()))
         return {
             "route_options": route_legs,
             "transport_options": transport,
             "hotels": hotels,
             "attractions": attractions,
-            "destination_knowledge": [
-                "Stub destination knowledge only; RAG is not connected."
-            ],
+            "destination_knowledge": ["Stub destination knowledge only; RAG is not connected."],
             "provider_sources": provider_sources(
                 providers,
                 fetched_at,
                 attractions=attractions,
             ),
+            "warnings": list(dict.fromkeys([*state["warnings"], *provider_warnings])),
         }
 
     return research_node

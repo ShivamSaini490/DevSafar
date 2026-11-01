@@ -1,4 +1,3 @@
-
 import hashlib
 import hmac
 import json
@@ -30,6 +29,14 @@ class TemporaryChatTurn:
     issued_token: str | None
     context_message_count: int
     trip: TripResponse
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedTemporaryTurn:
+    token: str
+    issued_token: str | None
+    messages: list[TemporaryMessage]
+    previous_trip: TripResponse | None
 
 
 class TemporaryChatService:
@@ -68,6 +75,44 @@ class TemporaryChatService:
         temp_token: str | None,
         content: str,
     ) -> TemporaryChatTurn:
+        prepared = await self.prepare_turn(
+            temp_session_id=temp_session_id,
+            temp_token=temp_token,
+        )
+
+        return await self.run_prepared(
+            temp_session_id=temp_session_id,
+            content=content,
+            prepared=prepared,
+        )
+
+    async def run_prepared(
+        self,
+        *,
+        temp_session_id: str,
+        content: str,
+        prepared: PreparedTemporaryTurn,
+    ) -> TemporaryChatTurn:
+        temporary_chat_tracing_enabled(self.settings)
+        trip = await self.planner.run(
+            conversation_id=None,
+            user_prompt=content,
+            previous_trip=prepared.previous_trip,
+            chat_mode="temporary",
+        )
+        return await self.complete_turn(
+            temp_session_id=temp_session_id,
+            content=content,
+            prepared=prepared,
+            trip=trip,
+        )
+
+    async def prepare_turn(
+        self,
+        *,
+        temp_session_id: str,
+        temp_token: str | None,
+    ) -> PreparedTemporaryTurn:
         issued_token: str | None = None
         if temp_token is None:
             temp_token = secrets.token_urlsafe(32)
@@ -79,16 +124,24 @@ class TemporaryChatService:
             if raw_context is None:
                 raise AppError(404, "temporary_chat_not_found", "Temporary chat not found.")
             messages, previous_trip = self._decode_context(cast(str, raw_context))
-
-        temporary_chat_tracing_enabled(self.settings)
-        trip = await self.planner.run(
-            conversation_id=None,
-            user_prompt=content,
+        return PreparedTemporaryTurn(
+            token=temp_token,
+            issued_token=issued_token,
+            messages=messages,
             previous_trip=previous_trip,
-            chat_mode="temporary",
         )
+
+    async def complete_turn(
+        self,
+        *,
+        temp_session_id: str,
+        content: str,
+        prepared: PreparedTemporaryTurn,
+        trip: TripResponse,
+    ) -> TemporaryChatTurn:
         assistant_summary = summarize_trip(trip)
 
+        messages = list(prepared.messages)
         messages.extend(
             (
                 TemporaryMessage(role="user", content=content),
@@ -98,22 +151,20 @@ class TemporaryChatService:
         messages = self._bounded_messages(messages, trip)
         serialized = self._serialize_context(messages, trip)
         await self.redis.set(
-            self._context_key(temp_session_id, temp_token),
+            self._context_key(temp_session_id, prepared.token),
             serialized,
             ex=self.settings.temporary_chat_ttl_seconds,
         )
         return TemporaryChatTurn(
             assistant_message=assistant_summary,
-            issued_token=issued_token,
+            issued_token=prepared.issued_token,
             context_message_count=len(messages),
             trip=trip,
         )
 
     def _context_key(self, temp_session_id: str, temp_token: str) -> str:
         payload = f"{temp_session_id}:{temp_token}".encode()
-        digest = hmac.new(
-            self.settings.auth_secret.encode(), payload, hashlib.sha256
-        ).hexdigest()
+        digest = hmac.new(self.settings.auth_secret.encode(), payload, hashlib.sha256).hexdigest()
         return f"{TEMPORARY_CHAT_KEY_PREFIX}:{digest}"
 
     def _bounded_messages(
@@ -133,9 +184,7 @@ class TemporaryChatService:
         return bounded
 
     @staticmethod
-    def _serialize_context(
-        messages: list[TemporaryMessage], trip: TripResponse
-    ) -> str:
+    def _serialize_context(messages: list[TemporaryMessage], trip: TripResponse) -> str:
         return json.dumps(
             {
                 "messages": messages,
@@ -158,6 +207,4 @@ class TemporaryChatService:
             trip = TripResponse.model_validate(previous) if previous is not None else None
             return cast(list[TemporaryMessage], messages), trip
         except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
-            raise AppError(
-                404, "temporary_chat_not_found", "Temporary chat not found."
-            ) from exc
+            raise AppError(404, "temporary_chat_not_found", "Temporary chat not found.") from exc

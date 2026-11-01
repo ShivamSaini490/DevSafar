@@ -20,6 +20,12 @@ class SavedChatTurn:
     trip: TripResponse
 
 
+@dataclass(frozen=True, slots=True)
+class AsyncSavedTurn:
+    user_message: Message
+    previous_trip: TripResponse | None
+
+
 def summarize_trip(response: TripResponse) -> str:
     feasibility = (
         "yes" if response.feasible is True else "no" if response.feasible is False else "unknown"
@@ -27,7 +33,11 @@ def summarize_trip(response: TripResponse) -> str:
     if response.status == "needs_clarification":
         reason = "critical trip details are missing"
     elif response.feasible is False:
-        reason = response.warnings[0] if response.warnings else "a current constraint is blocking the plan"
+        reason = (
+            response.warnings[0]
+            if response.warnings
+            else "a current constraint is blocking the plan"
+        )
     elif response.feasible is None:
         reason_warning = next(
             (
@@ -106,6 +116,57 @@ class ChatService:
         await self.db.refresh(user_message)
         await self.db.refresh(assistant_message)
         return SavedChatTurn(user_message, assistant_message, trip)
+
+    async def begin_async_turn(
+        self,
+        *,
+        conversation_id: UUID,
+        owner_id: UUID,
+        content: str,
+    ) -> AsyncSavedTurn:
+        await self.conversation_service.get_required(
+            conversation_id=conversation_id,
+            owner_id=owner_id,
+        )
+        previous_trip = await self.trips.latest_response(conversation_id)
+        await self.db.rollback()
+        conversation = await self.conversation_service.get_required(
+            conversation_id=conversation_id,
+            owner_id=owner_id,
+            for_update=True,
+        )
+        user_message = await self.messages.create(
+            conversation_id=conversation.id,
+            role="user",
+            content=content,
+            created_at=utc_now(),
+        )
+        await self.db.commit()
+        await self.db.refresh(user_message)
+        return AsyncSavedTurn(user_message=user_message, previous_trip=previous_trip)
+
+    async def complete_async_turn(
+        self,
+        *,
+        conversation_id: UUID,
+        owner_id: UUID,
+        trip: TripResponse,
+    ) -> Message:
+        conversation = await self.conversation_service.get_required(
+            conversation_id=conversation_id,
+            owner_id=owner_id,
+            for_update=True,
+        )
+        assistant_message = await self.messages.create(
+            conversation_id=conversation.id,
+            role="assistant",
+            content=summarize_trip(trip),
+            created_at=utc_now(),
+        )
+        await self.trips.persist(conversation_id=conversation.id, response=trip)
+        await self.db.commit()
+        await self.db.refresh(assistant_message)
+        return assistant_message
 
     async def list_messages(
         self,

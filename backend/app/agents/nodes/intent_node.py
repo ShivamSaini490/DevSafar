@@ -1,7 +1,6 @@
 from collections.abc import Callable
 from datetime import datetime
 from typing import Any
-from uuid import uuid4
 
 from app.agents.llm import RETURN_TIME_ASSUMPTION, IntentModel
 from app.agents.state import TravelState
@@ -71,7 +70,7 @@ def build_intent_node(
         questions = _critical_questions(requirements, now=now_provider())
         if questions:
             response = TripResponse(
-                trip_id=uuid4(),
+                trip_id=state["trip_id"],
                 status="needs_clarification",
                 requirements=requirements,
                 feasible=None,
