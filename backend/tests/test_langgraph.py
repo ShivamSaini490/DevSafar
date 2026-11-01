@@ -67,6 +67,7 @@ async def test_example_prompt_maps_to_canonical_typed_response(
     assert (
         "Feasibility cannot be verified: transport times are unverified/stub." in response.warnings
     )
+    assert response.destination_tips == []
     assert TripResponse.model_validate(response.model_dump()) == response
     assert set(response.model_dump()) == {
         "trip_id",
@@ -82,6 +83,7 @@ async def test_example_prompt_maps_to_canonical_typed_response(
         "budget",
         "data_sources",
         "booking_links",
+        "destination_tips",
     }
 
 

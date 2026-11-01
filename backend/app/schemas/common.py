@@ -34,6 +34,10 @@ class DataSource(StrictSchema):
     name: str = Field(min_length=1, max_length=100)
     price_type: PriceType
     fetched_at: datetime
+    updated_at: Date | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
     status: Literal["ok", "degraded"] = "ok"
 
 

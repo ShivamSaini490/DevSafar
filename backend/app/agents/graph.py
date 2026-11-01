@@ -25,6 +25,7 @@ from app.core.rate_limiter import ExternalCallBudget
 from app.core.security import utc_now
 from app.core.tracing import ChatMode, graph_tracing_context
 from app.integrations.base import ProviderBundle
+from app.rag.retriever import DestinationKnowledgeRetriever
 from app.schemas.trip import TripResponse
 from app.utils.datetime_utils import india_now
 
@@ -93,6 +94,7 @@ class LangGraphTripPlanner:
         provider_factory: Callable[[datetime], ProviderBundle] = ProviderBundle.stubs,
         now_provider: Callable[[], datetime] = india_now,
         call_budget: ExternalCallBudget | None = None,
+        rag_retriever: DestinationKnowledgeRetriever | None = None,
     ) -> None:
         self.settings = settings
         workflow = StateGraph(TravelState)
@@ -108,7 +110,14 @@ class LangGraphTripPlanner:
         )
         workflow.add_node(
             "research",
-            _progress_node("research", build_research_node(provider_factory)),
+            _progress_node(
+                "research",
+                build_research_node(
+                    provider_factory,
+                    settings=settings,
+                    rag_retriever=rag_retriever,
+                ),
+            ),
         )
         workflow.add_node(
             "planning",
@@ -156,6 +165,7 @@ class LangGraphTripPlanner:
             "hotels": [],
             "attractions": [],
             "destination_knowledge": [],
+            "external_call_counts": {},
             "itinerary": [],
             "budget_breakdown": None,
             "validation_errors": [],

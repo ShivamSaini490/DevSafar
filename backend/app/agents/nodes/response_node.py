@@ -55,6 +55,7 @@ def build_response_node(settings: Settings) -> Any:
             itinerary_days=state["itinerary"],
             budget=state["budget_breakdown"] or empty_budget(),
             data_sources=state["provider_sources"],
+            destination_tips=state["destination_knowledge"],
             booking_links=booking_service.build(
                 requirements,
                 state["route_options"],

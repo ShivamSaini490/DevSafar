@@ -8,7 +8,7 @@ from app.schemas.common import DataSource
 from app.schemas.hotel import HotelOption
 from app.schemas.itinerary import ItineraryDay
 from app.schemas.transport import RouteLeg, TransportOption
-from app.schemas.trip import TripRequirements, TripResponse, TripStatus
+from app.schemas.trip import DestinationTip, TripRequirements, TripResponse, TripStatus
 
 
 class TravelState(TypedDict):
@@ -21,7 +21,8 @@ class TravelState(TypedDict):
     transport_options: list[TransportOption]
     hotels: list[HotelOption]
     attractions: list[AttractionOption]
-    destination_knowledge: list[str]
+    destination_knowledge: list[DestinationTip]
+    external_call_counts: dict[str, int]
     itinerary: list[ItineraryDay]
     budget_breakdown: BudgetBreakdown | None
     validation_errors: list[str]

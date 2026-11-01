@@ -4,6 +4,7 @@ from decimal import Decimal
 from functools import lru_cache
 from pathlib import Path
 from typing import Literal
+from urllib.parse import urlsplit
 
 from pydantic import Field, PrivateAttr, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -100,6 +101,19 @@ class Settings(BaseSettings):
     )
     qdrant_url: str | None = None
     qdrant_api_key: SecretStr | None = None
+    qdrant_collection: str = Field(
+        default="devsafar_travel_knowledge",
+        pattern=r"^[A-Za-z0-9_-]{1,100}$",
+    )
+    rag_enabled: bool = False
+    embedding_model: str = Field(
+        default="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
+        min_length=1,
+        max_length=200,
+    )
+    rag_top_k: int = Field(default=3, ge=1, le=10)
+    rag_score_threshold: float = Field(default=0.45, ge=0, le=1)
+    rag_timeout_seconds: float = Field(default=8.0, gt=0, le=60)
 
     smtp_host: str | None = None
     smtp_port: int = Field(default=587, ge=1, le=65535)
@@ -160,6 +174,20 @@ class Settings(BaseSettings):
         if normalized not in allowed:
             raise ValueError(f"log_level must be one of {sorted(allowed)}")
         return normalized
+
+    @field_validator("qdrant_url")
+    @classmethod
+    def validate_qdrant_url(cls, value: str | None) -> str | None:
+        if value is None or not value.strip():
+            return None
+        parsed = urlsplit(value.strip())
+        hostname = (parsed.hostname or "").casefold().rstrip(".")
+        if not hostname:
+            raise ValueError("QDRANT_URL must contain a hostname")
+        return validate_external_base_url(
+            value,
+            allowed_hosts=frozenset({hostname}),
+        )
 
     @model_validator(mode="after")
     def validate_security_settings(self) -> "Settings":
@@ -225,6 +253,23 @@ class Settings(BaseSettings):
             return (
                 "Tavily is configured but GROQ_API_KEY is empty; grounded attraction "
                 "extraction will use the labelled stub fallback.",
+            )
+        return ()
+
+    @property
+    def rag_configured(self) -> bool:
+        return bool(
+            self.rag_enabled
+            and self.qdrant_url
+            and self.qdrant_api_key is not None
+            and self.qdrant_api_key.get_secret_value().strip()
+        )
+
+    def rag_configuration_warnings(self) -> tuple[str, ...]:
+        if self.rag_enabled and not self.rag_configured:
+            return (
+                "RAG_ENABLED is true but QDRANT_URL or QDRANT_API_KEY is empty; "
+                "destination knowledge will degrade safely.",
             )
         return ()
 

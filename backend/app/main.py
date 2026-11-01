@@ -21,6 +21,9 @@ from app.db.session import create_db_engine, create_redis_client, create_session
 from app.integrations.base import ProviderBundle
 from app.integrations.maps_provider import OsmMapsProvider
 from app.integrations.tavily_provider import TavilyAttractionsProvider
+from app.rag.embeddings import FastEmbedService
+from app.rag.retriever import RAGRetriever
+from app.rag.vector_store import QdrantVectorStore
 from app.tasks.cleanup_tasks import run_cleanup_loop
 
 logger = logging.getLogger(__name__)
@@ -74,7 +77,23 @@ def _lifespan(settings: Settings) -> Callable[[FastAPI], AbstractAsyncContextMan
         app.state.external_call_budget = external_call_budget
         provider_http_client: httpx.AsyncClient | None = None
         attraction_extractor: GroqAttractionExtractor | None = None
+        rag_store: QdrantVectorStore | None = None
         if not hasattr(app.state, "trip_planner"):
+            rag_retriever: RAGRetriever | None = None
+            if settings.rag_configured:
+                embedder = FastEmbedService(settings.embedding_model)
+                rag_store = QdrantVectorStore.from_settings(
+                    settings,
+                    vector_size=embedder.dimension,
+                )
+                rag_retriever = RAGRetriever(
+                    embedder,
+                    rag_store,
+                    top_k=settings.rag_top_k,
+                    score_threshold=settings.rag_score_threshold,
+                    timeout_seconds=settings.rag_timeout_seconds,
+                )
+                app.state.rag_store = rag_store
             if settings.maps_provider == "osm" or settings.tavily_configured:
                 provider_http_client = httpx.AsyncClient()
             if settings.tavily_configured:
@@ -115,6 +134,7 @@ def _lifespan(settings: Settings) -> Callable[[FastAPI], AbstractAsyncContextMan
                     settings,
                     provider_factory=provider_factory,
                     call_budget=external_call_budget,
+                    rag_retriever=rag_retriever,
                 )
             elif settings.tavily_configured:
                 assert provider_http_client is not None
@@ -137,11 +157,13 @@ def _lifespan(settings: Settings) -> Callable[[FastAPI], AbstractAsyncContextMan
                     settings,
                     provider_factory=tavily_provider_factory,
                     call_budget=external_call_budget,
+                    rag_retriever=rag_retriever,
                 )
             else:
                 app.state.trip_planner = LangGraphTripPlanner(
                     settings,
                     call_budget=external_call_budget,
+                    rag_retriever=rag_retriever,
                 )
         cleanup_task: asyncio.Task[None] | None = None
         if settings.cleanup_enabled:
@@ -159,6 +181,8 @@ def _lifespan(settings: Settings) -> Callable[[FastAPI], AbstractAsyncContextMan
                     await cleanup_task
             if provider_http_client is not None:
                 await provider_http_client.aclose()
+            if rag_store is not None:
+                await rag_store.close()
             await redis.aclose()
             await engine.dispose()
 
@@ -177,6 +201,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         logger.warning(smtp_warning)
     for tavily_warning in app_settings.tavily_configuration_warnings():
         logger.warning(tavily_warning)
+    for rag_warning in app_settings.rag_configuration_warnings():
+        logger.warning(rag_warning)
 
     application = FastAPI(
         title=app_settings.app_name,

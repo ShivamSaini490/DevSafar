@@ -4,7 +4,7 @@ from decimal import Decimal
 from typing import Literal
 from uuid import UUID
 
-from pydantic import Field, field_validator
+from pydantic import Field, HttpUrl, field_validator
 
 from app.schemas.attraction import AttractionOption
 from app.schemas.budget import BudgetBreakdown
@@ -69,6 +69,13 @@ class TripRequirements(StrictSchema):
         return value
 
 
+class DestinationTip(StrictSchema):
+    title: str = Field(min_length=1, max_length=200)
+    snippet: str = Field(min_length=1, max_length=300)
+    source_url: HttpUrl
+    updated_at: date
+
+
 class TripResponse(StrictSchema):
     trip_id: UUID
     status: TripStatus = Field(
@@ -87,4 +94,5 @@ class TripResponse(StrictSchema):
     itinerary_days: list[ItineraryDay] = Field(default_factory=list)
     budget: BudgetBreakdown
     data_sources: list[DataSource] = Field(default_factory=list)
+    destination_tips: list[DestinationTip] = Field(default_factory=list)
     booking_links: list[BookingLink] = Field(default_factory=list)
