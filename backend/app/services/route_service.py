@@ -19,9 +19,7 @@ def ordered_route_stops(requirements: TripRequirements) -> list[str]:
     if requirements.origin is None:
         return []
     stops = [requirements.origin, *requirements.destinations]
-    return_requested = requirements.return_deadline is not None or bool(
-        requirements.destinations and requirements.destinations[-1] == requirements.origin
-    )
+    return_requested = requirements.return_to_origin is not False
     if return_requested and stops[-1] != requirements.origin:
         stops.append(requirements.origin)
     return [stop for index, stop in enumerate(stops) if index == 0 or stop != stops[index - 1]]
@@ -71,6 +69,10 @@ class RouteService:
                             price_type="unknown",
                             source=("stub_route_schedule" if use_stub_defaults else "osrm_unavailable"),
                             fetched_at=utc_now(),
+                            status="unavailable",
+                            provider=("stub" if use_stub_defaults else "OSRM"),
+                            observed_at=utc_now(),
+                            price_unit="one route leg",
                         ),
                     )
                 )

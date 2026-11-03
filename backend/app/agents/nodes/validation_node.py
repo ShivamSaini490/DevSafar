@@ -4,7 +4,7 @@ from typing import Any
 from app.agents.state import TravelState
 from app.services.itinerary_service import ItineraryService
 
-UNVERIFIED_TIMES_WARNING = "Feasibility cannot be verified: transport times are unverified/stub."
+UNVERIFIED_TIMES_WARNING = "Feasibility based on rough estimates; verify timetables."
 
 
 def _has_verified_durations(state: TravelState) -> bool:
@@ -15,6 +15,7 @@ def _has_verified_durations(state: TravelState) -> bool:
         and leg.arrival_at is not None
         and leg.duration_source is not None
         and not leg.duration_source.casefold().startswith("stub")
+        and leg.duration_source.casefold() != "distance_formula"
         for leg in legs
     )
 
@@ -72,11 +73,9 @@ async def validation_node(state: TravelState) -> dict[str, Any]:
     verified_durations = _has_verified_durations(state)
     if errors:
         feasible: bool | None = False
-    elif (
-        verified_durations
-        and return_arrival is not None
-        and requirements.return_deadline is not None
-        and return_arrival <= requirements.return_deadline
+    elif verified_durations and (
+        requirements.return_deadline is None
+        or (return_arrival is not None and return_arrival <= requirements.return_deadline)
     ):
         feasible = True
     else:

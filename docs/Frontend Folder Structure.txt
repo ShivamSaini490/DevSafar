@@ -1,0 +1,171 @@
+Frontend architectural prompt :
+------------------------------
+
+Build the frontend for an Agentic AI Travel Planner using React, TypeScript, Vite, Tailwind CSS, shadcn/ui, Lucide React, React Router, Zustand, TanStack Query and Recharts.
+
+Follow the attached frontend architecture diagram and folder structure.
+
+Implement 7 screens/views: Sign In, Sign Up, Forgot/Reset Password, Main Chat with left sidebar and 7-day chat history, Trip Results with rich interactive cards/maps/charts, Profile/Settings, and Temporary Chat mode.
+
+Design a premium, clean, responsive ChatGPT-inspired layout with travel-specific visualization. Temporary chats must be tab-scoped, never appear in history, and not be persisted to localStorage. Saved conversations belong to authenticated users and expire seven days after creation; backend enforces expiry. No share-chat feature. Guests may explore using temporary chats. Provide loading, empty, error and streaming states.
+
+Create reusable components for budget donut charts, transport comparison charts, daily expenses, itinerary timeline, transport, hotels, attractions, map and AI chat. Use typed API service interfaces and mock adapters if backend is not ready; clearly label mock data. Do not invent live prices. Keep frontend API calls centralized, authentication cookie-safe, and never put secret API keys in the frontend. Produce runnable code, environment example, README, and concise module explanations. Implement in small testable steps.
+
+
+
+frontend/
+│
+├── public/
+│   ├── images/
+│   ├── icons/
+│   └── favicon.ico
+│
+├── src/
+│   │
+│   ├── app/
+│   │   ├── App.tsx
+│   │   ├── router.tsx
+│   │   └── providers.tsx
+│   │
+│   ├── pages/
+│   │   ├── SignInPage.tsx
+│   │   ├── SignUpPage.tsx
+│   │   ├── ForgotPasswordPage.tsx
+│   │   ├── VerifyOTPPage.tsx
+│   │   ├── ResetPasswordPage.tsx
+│   │   ├── ChatPage.tsx
+│   │   ├── TripResultsPage.tsx
+│   │   ├── ProfilePage.tsx
+│   │   └── NotFoundPage.tsx
+│   │
+│   ├── layouts/
+│   │   ├── AuthLayout.tsx
+│   │   └── ChatLayout.tsx
+│   │
+│   ├── components/
+│   │   ├── ui/
+│   │   │   ├── Button.tsx
+│   │   │   ├── Input.tsx
+│   │   │   ├── Card.tsx
+│   │   │   ├── Modal.tsx
+│   │   │   ├── Tabs.tsx
+│   │   │   ├── Skeleton.tsx
+│   │   │   └── Spinner.tsx
+│   │   │
+│   │   ├── sidebar/
+│   │   │   ├── AppSidebar.tsx
+│   │   │   ├── NewChatButton.tsx
+│   │   │   ├── ChatHistoryList.tsx
+│   │   │   ├── ChatHistoryItem.tsx
+│   │   │   └── UserMenu.tsx
+│   │   │
+│   │   └── common/
+│   │       ├── Navbar.tsx
+│   │       ├── ErrorBoundary.tsx
+│   │       ├── EmptyState.tsx
+│   │       └── ConfirmDialog.tsx
+│   │
+│   ├── features/
+│   │   │
+│   │   ├── auth/
+│   │   │   ├── components/
+│   │   │   │   ├── SignInForm.tsx
+│   │   │   │   ├── SignUpForm.tsx
+│   │   │   │   ├── ForgotPasswordForm.tsx
+│   │   │   │   ├── OTPInput.tsx
+│   │   │   │   └── ResetPasswordForm.tsx
+│   │   │   └── ProtectedRoute.tsx
+│   │   │
+│   │   ├── chat/
+│   │   │   ├── components/
+│   │   │   │   ├── ChatWindow.tsx
+│   │   │   │   ├── ChatInput.tsx
+│   │   │   │   ├── ChatMessage.tsx
+│   │   │   │   ├── ChatMessages.tsx
+│   │   │   │   ├── ChatWelcome.tsx
+│   │   │   │   ├── ChatLoading.tsx
+│   │   │   │   └── AgentProgress.tsx
+│   │   │   └── hooks/
+│   │   │       └── useChatStream.ts
+│   │   │
+│   │   ├── temporary-chat/
+│   │   │   ├── TemporaryChatBanner.tsx
+│   │   │   └── useTemporaryChat.ts
+│   │   │
+│   │   ├── itinerary/
+│   │   │   ├── TripSummary.tsx
+│   │   │   ├── DayTabs.tsx
+│   │   │   ├── DayTimeline.tsx
+│   │   │   └── ActivityCard.tsx
+│   │   │
+│   │   ├── transport/
+│   │   │   ├── TransportCard.tsx
+│   │   │   ├── TransportFilters.tsx
+│   │   │   └── TransportComparison.tsx
+│   │   │
+│   │   ├── hotels/
+│   │   │   ├── HotelCard.tsx
+│   │   │   └── HotelsList.tsx
+│   │   │
+│   │   ├── attractions/
+│   │   │   ├── AttractionCard.tsx
+│   │   │   └── AttractionsList.tsx
+│   │   │
+│   │   ├── maps/
+│   │   │   ├── TripRouteMap.tsx
+│   │   │   └── LocationMarker.tsx
+│   │   │
+│   │   ├── analytics/
+│   │   │   ├── BudgetDonutChart.tsx
+│   │   │   ├── TransportBarChart.tsx
+│   │   │   ├── DailyExpensesChart.tsx
+│   │   │   ├── BudgetProgressBar.tsx
+│   │   │   └── TripStatsCards.tsx
+│   │   │
+│   │   └── profile/
+│   │       ├── ProfileForm.tsx
+│   │       └── ChangePasswordForm.tsx
+│   │
+│   ├── services/
+│   │   ├── apiClient.ts
+│   │   ├── authApi.ts
+│   │   ├── chatApi.ts
+│   │   ├── tripApi.ts
+│   │   └── profileApi.ts
+│   │
+│   ├── hooks/
+│   │   ├── useAuth.ts
+│   │   └── useDebounce.ts
+│   │
+│   ├── store/
+│   │   ├── authStore.ts
+│   │   ├── chatStore.ts
+│   │   └── tripStore.ts
+│   │
+│   ├── types/
+│   │   ├── auth.ts
+│   │   ├── chat.ts
+│   │   ├── trip.ts
+│   │   ├── transport.ts
+│   │   ├── hotel.ts
+│   │   └── budget.ts
+│   │
+│   ├── utils/
+│   │   ├── formatCurrency.ts
+│   │   ├── formatDate.ts
+│   │   └── constants.ts
+│   │
+│   ├── styles/
+│   │   └── globals.css
+│   │
+│   └── main.tsx
+│
+├── .env.example
+├── .gitignore
+├── Dockerfile
+├── index.html
+├── package.json
+├── tsconfig.json
+├── vite.config.ts
+├── eslint.config.js
+└── README.md

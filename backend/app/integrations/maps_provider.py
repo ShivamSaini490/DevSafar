@@ -2,6 +2,7 @@
 import asyncio
 import hashlib
 import logging
+import math
 import time
 from collections.abc import Awaitable, Callable
 from decimal import ROUND_CEILING, ROUND_HALF_UP, Decimal
@@ -117,7 +118,13 @@ class OsmMapsProvider:
 
         fetched_at = utc_now()
         legs: list[RouteLeg] = []
-        for (origin, destination), result in zip(pairs, osrm_legs, strict=True):
+        point_pairs = zip(points, points[1:], strict=False)
+        for (origin, destination), result, (origin_point, destination_point) in zip(
+            pairs,
+            osrm_legs,
+            point_pairs,
+            strict=True,
+        ):
             distance_km = (result.distance / Decimal("1000")).quantize(
                 Decimal("0.001"), rounding=ROUND_HALF_UP
             )
@@ -135,15 +142,43 @@ class OsmMapsProvider:
                     duration_minutes=duration_minutes,
                     duration_source="osrm",
                     distance_km=distance_km,
+                    great_circle_distance_km=self._great_circle_distance_km(
+                        origin_point,
+                        destination_point,
+                    ),
                     price=PriceQuote(
                         amount=fuel_estimate,
                         price_type="estimate",
                         source="fuel_formula",
                         fetched_at=fetched_at,
+                        status="formula_estimate",
+                        provider="OSRM+fuel_formula",
+                        observed_at=fetched_at,
+                        price_unit="private vehicle one-way",
                     ),
                 )
             )
         return legs
+
+    @staticmethod
+    def _great_circle_distance_km(origin: GeoPoint, destination: GeoPoint) -> Decimal:
+        """Return geometry input for estimates; fare arithmetic remains Decimal-only."""
+
+        origin_lat = math.radians(float(origin.lat))
+        destination_lat = math.radians(float(destination.lat))
+        latitude_delta = destination_lat - origin_lat
+        longitude_delta = math.radians(float(destination.lon - origin.lon))
+        haversine = (
+            math.sin(latitude_delta / 2) ** 2
+            + math.cos(origin_lat)
+            * math.cos(destination_lat)
+            * math.sin(longitude_delta / 2) ** 2
+        )
+        central_angle = 2 * math.asin(min(1.0, math.sqrt(haversine)))
+        return Decimal(str(6371.0088 * central_angle)).quantize(
+            Decimal("0.001"),
+            rounding=ROUND_HALF_UP,
+        )
 
     async def geocode(self, city: str) -> GeoPoint | None:
         """Geocode one city; only the city name and country code leave the app."""
@@ -288,6 +323,10 @@ class OsmMapsProvider:
                     price_type="unknown",
                     source="osrm_unavailable",
                     fetched_at=fetched_at,
+                    status="unavailable",
+                    provider="OSRM",
+                    observed_at=fetched_at,
+                    price_unit="one route leg",
                 ),
             )
             for origin, destination in pairs

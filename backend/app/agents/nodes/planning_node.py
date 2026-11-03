@@ -4,11 +4,12 @@ from typing import Any
 
 from app.agents.state import TravelState
 from app.core.config import Settings
+from app.schemas.common import DataSource
 from app.services.budget_service import BudgetService
-from app.services.hotel_service import HotelService
+from app.services.fare_estimator import FareEstimator
 from app.services.itinerary_service import ItineraryService
+from app.services.price_engine import PriceEngine
 from app.services.route_service import RouteService
-from app.services.transport_service import TransportService
 from app.utils.datetime_utils import at_india_time, india_now
 
 
@@ -16,6 +17,7 @@ def build_planning_node(
     settings: Settings,
     *,
     now_provider: Callable[[], datetime] = india_now,
+    price_engine: PriceEngine | None = None,
 ) -> Any:
     async def planning_node(state: TravelState) -> dict[str, Any]:
         requirements = state["requirements"]
@@ -57,58 +59,132 @@ def build_planning_node(
                 ),
                 None,
             )
-        transport_options = (
-            TransportService.from_route_legs(route_legs)
-            if settings.maps_provider == "osm"
-            else state["transport_options"]
+        fetched_at = state["fetched_at"]
+        if fetched_at is None:
+            raise ValueError("Planning requires fetched_at")
+        fare_plan = FareEstimator(settings).build(
+            requirements=requirements,
+            road_legs=route_legs,
+            fetched_at=fetched_at,
         )
-        hotels = HotelService.align_with_route(
-            requirements,
-            route_legs,
-            state["hotels"],
-            min_stay_hours_per_destination=settings.min_stay_hours_per_destination,
+        price_sources: list[DataSource] = []
+        price_warnings: list[str] = []
+        if price_engine is not None:
+            fare_plan, price_sources, price_warnings = await price_engine.enrich_plan(
+                trip_id=state["trip_id"],
+                requirements=requirements,
+                plan=fare_plan,
+                persist_history=state["chat_mode"] != "temporary",
+            )
+        selected_comparison = next(
+            (
+                comparison
+                for comparison in fare_plan.mode_comparison
+                if comparison.recommended is True
+            ),
+            None,
         )
-        return {
-            "route_options": route_legs,
-            "transport_options": transport_options,
-            "hotels": hotels,
-            "itinerary": ItineraryService.build(
+        budget = BudgetService.build_estimated_range(
+            comparison=selected_comparison,
+            hotel_total_min=fare_plan.hotel_total_min,
+            hotel_total_max=fare_plan.hotel_total_max,
+            food_total_min=fare_plan.food_total_min,
+            food_total_max=fare_plan.food_total_max,
+            local_transport_total_min=fare_plan.local_transport_total_min,
+            local_transport_total_max=fare_plan.local_transport_total_max,
+            attractions=state["attractions"],
+            fetched_at=fetched_at,
+        )
+        if fare_plan.recommended_mode not in {None, "road"}:
+            itinerary = ItineraryService.build_estimated_mode(
                 requirements,
-                route_legs,
+                fare_plan.route_legs,
+            )
+        else:
+            itinerary = ItineraryService.build(
+                requirements,
+                fare_plan.route_legs,
                 attractions=state["attractions"],
                 min_stay_hours_per_destination=settings.min_stay_hours_per_destination,
                 now=planning_now,
-            ),
-            "budget_breakdown": BudgetService.build(
-                requirements=requirements,
-                route_legs=route_legs,
-                transport_options=transport_options,
-                hotels=hotels,
-                attractions=state["attractions"],
-                food_per_day_per_traveler=(settings.food_estimate_per_day_per_traveler),
-                buffer_percent=settings.budget_buffer_percent,
-            ),
+            )
+        provider_sources = [
+            source
+            for source in state["provider_sources"]
+            if source.name
+            not in {
+                "stub_transport",
+                "stub_hotels",
+                "distance_formula",
+                "tier_assumption",
+                "configured_estimates",
+            }
+        ]
+        provider_sources.extend(
+            [
+                DataSource(
+                    name="distance_formula",
+                    price_type="estimate",
+                    fetched_at=fetched_at,
+                    status=(
+                        "ok"
+                        if selected_comparison is not None
+                        else "degraded"
+                    ),
+                ),
+                DataSource(
+                    name="tier_assumption",
+                    price_type="estimate",
+                    fetched_at=fetched_at,
+                    status="ok",
+                ),
+                DataSource(
+                    name="configured_estimates",
+                    price_type="estimate",
+                    fetched_at=fetched_at,
+                    status="ok",
+                ),
+            ]
+        )
+        provider_sources.extend(price_sources)
+        budget_warnings: list[str] = []
+        if budget.estimated_total_min is not None:
+            if requirements.budget is None:
+                budget_warnings.append(
+                    "No budget was provided; use the estimated total range as a suggested budget."
+                )
+            elif budget.estimated_total_min > requirements.budget:
+                budget_warnings.append(
+                    "The minimum estimated total exceeds the requested budget."
+                )
+        return {
+            "route_options": fare_plan.route_legs,
+            "transport_options": fare_plan.transport_options,
+            "hotels": fare_plan.hotels,
+            "itinerary": itinerary,
+            "budget_breakdown": budget,
+            "mode_comparison": fare_plan.mode_comparison,
+            "provider_sources": provider_sources,
             "retry_count": state["retry_count"] + (1 if is_retry else 0),
             "validation_errors": [],
             "warnings": list(
                 dict.fromkeys(
                     [
                         *state["warnings"],
-                        *RouteService.schedule_warnings(
-                            route_legs,
-                            daily_hours=settings.max_driving_hours_per_day,
-                            latest_arrival_hour=settings.driving_latest_arrival_hour,
-                            start_date=requirements.start_date,
-                            baseline_return_at=baseline_return_at,
-                        ),
                         *(
-                            [
-                                "Road estimates drive feasibility; official train, bus, and "
-                                "flight search pages are included as alternatives."
-                            ]
-                            if settings.maps_provider == "osm"
+                            RouteService.schedule_warnings(
+                                fare_plan.route_legs,
+                                daily_hours=settings.max_driving_hours_per_day,
+                                latest_arrival_hour=settings.driving_latest_arrival_hour,
+                                start_date=requirements.start_date,
+                                baseline_return_at=baseline_return_at,
+                            )
+                            if fare_plan.recommended_mode == "road"
                             else []
                         ),
+                        *fare_plan.warnings,
+                        *price_warnings,
+                        *budget_warnings,
                         *(
                             [
                                 "Road cost assumes a private car at INR "
@@ -116,7 +192,7 @@ def build_planning_node(
                                 "FUEL_COST_PER_KM.",
                                 "OSRM durations exclude traffic, so real travel time may be longer.",
                             ]
-                            if settings.maps_provider == "osm"
+                            if fare_plan.recommended_mode == "road"
                             else []
                         ),
                     ]

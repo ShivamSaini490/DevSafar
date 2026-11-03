@@ -4,11 +4,11 @@ from decimal import Decimal
 from typing import Literal
 from uuid import UUID
 
-from pydantic import Field, HttpUrl, field_validator
+from pydantic import Field, HttpUrl, field_validator, model_validator
 
 from app.schemas.attraction import AttractionOption
 from app.schemas.budget import BudgetBreakdown
-from app.schemas.common import BookingLink, DataSource, StrictSchema
+from app.schemas.common import BookingLink, DataSource, PriceQuote, StrictSchema
 from app.schemas.hotel import HotelOption
 from app.schemas.itinerary import ItineraryDay
 from app.schemas.transport import RouteLeg, TransportOption
@@ -48,6 +48,7 @@ class TripRequirements(StrictSchema):
     travelers: int = Field(default=1, ge=1, le=20)
     budget: Decimal | None = Field(default=None, ge=0)
     return_deadline: datetime | None = None
+    return_to_origin: bool | None = None
     preferences: list[str] = Field(default_factory=list)
     ambiguities: list[str] = Field(default_factory=list)
 
@@ -76,6 +77,30 @@ class DestinationTip(StrictSchema):
     updated_at: date
 
 
+class ModeComparison(StrictSchema):
+    mode: Literal["road", "train", "bus", "flight"]
+    duration_minutes_min: int | None = Field(default=None, ge=0)
+    duration_minutes_max: int | None = Field(default=None, ge=0)
+    transport_price: PriceQuote
+    total_price: PriceQuote
+    meets_deadline_estimate: bool | None = None
+    recommended: bool | None = None
+    notes: list[str] = Field(default_factory=list)
+    mixed_confidence: bool = False
+
+    @model_validator(mode="after")
+    def validate_duration_range(self) -> "ModeComparison":
+        if (self.duration_minutes_min is None) != (self.duration_minutes_max is None):
+            raise ValueError("Mode duration ranges require both minimum and maximum")
+        if (
+            self.duration_minutes_min is not None
+            and self.duration_minutes_max is not None
+            and self.duration_minutes_min > self.duration_minutes_max
+        ):
+            raise ValueError("Mode minimum duration cannot exceed maximum")
+        return self
+
+
 class TripResponse(StrictSchema):
     trip_id: UUID
     status: TripStatus = Field(
@@ -87,6 +112,8 @@ class TripResponse(StrictSchema):
     requirements: TripRequirements
     feasible: bool | None
     warnings: list[str] = Field(default_factory=list)
+    assumptions: list[str] = Field(default_factory=list)
+    suggested_followups: list[str] = Field(default_factory=list)
     route_legs: list[RouteLeg] = Field(default_factory=list)
     transport_options: list[TransportOption] = Field(default_factory=list)
     hotels: list[HotelOption] = Field(default_factory=list)
@@ -96,3 +123,4 @@ class TripResponse(StrictSchema):
     data_sources: list[DataSource] = Field(default_factory=list)
     destination_tips: list[DestinationTip] = Field(default_factory=list)
     booking_links: list[BookingLink] = Field(default_factory=list)
+    mode_comparison: list[ModeComparison] = Field(default_factory=list)

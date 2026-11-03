@@ -1,0 +1,78 @@
+[
+  {
+    "iata_code": "HYD",
+    "city": "Hyderabad",
+    "state": "Telangana",
+    "latitude": 17.2403,
+    "longitude": 78.4294,
+    "nearest_airport_for": ["Hyderabad", "Secunderabad"]
+  },
+  {
+    "iata_code": "DEL",
+    "city": "Delhi",
+    "state": "Delhi",
+    "latitude": 28.5562,
+    "longitude": 77.1000,
+    "nearest_airport_for": ["Delhi", "New Delhi", "Noida", "Gurugram", "Gurgaon"]
+  },
+  {
+    "iata_code": "BOM",
+    "city": "Mumbai",
+    "state": "Maharashtra",
+    "nearest_airport_for": ["Mumbai", "Navi Mumbai", "Thane"]
+  },
+  {
+    "iata_code": "BLR",
+    "city": "Bengaluru",
+    "state": "Karnataka",
+    "nearest_airport_for": ["Bengaluru", "Bangalore"]
+  },
+  {
+    "iata_code": "MAA",
+    "city": "Chennai",
+    "state": "Tamil Nadu",
+    "nearest_airport_for": ["Chennai", "Puducherry", "Pondicherry"]
+  },
+  {
+    "iata_code": "IXM",
+    "city": "Madurai",
+    "state": "Tamil Nadu",
+    "nearest_airport_for": ["Madurai", "Rameswaram", "Rameshwaram"]
+  },
+  {
+    "iata_code": "VGA",
+    "city": "Vijayawada",
+    "state": "Andhra Pradesh",
+    "nearest_airport_for": ["Vijayawada", "Amaravati", "Guntur"]
+  },
+  {
+    "iata_code": "CCU",
+    "city": "Kolkata",
+    "state": "West Bengal",
+    "nearest_airport_for": ["Kolkata", "Howrah"]
+  },
+  {
+    "iata_code": "COK",
+    "city": "Kochi",
+    "state": "Kerala",
+    "nearest_airport_for": ["Kochi", "Cochin", "Ernakulam"]
+  },
+  {
+    "iata_code": "PNQ",
+    "city": "Pune",
+    "state": "Maharashtra",
+    "nearest_airport_for": ["Pune"]
+  },
+  {
+    "iata_code": "AMD",
+    "city": "Ahmedabad",
+    "state": "Gujarat",
+    "nearest_airport_for": ["Ahmedabad", "Gandhinagar"]
+  },
+  {
+    "iata_code": "JAI",
+    "city": "Jaipur",
+    "state": "Rajasthan",
+    "nearest_airport_for": ["Jaipur"]
+  }
+]

@@ -1,20 +1,31 @@
 
 import asyncio
 import secrets
+from datetime import datetime
+from decimal import Decimal
 
 import pytest
+from fastapi import FastAPI
 from httpx import AsyncClient
 from redis.asyncio import Redis
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.agents.graph import LangGraphTripPlanner
 from app.core.config import Settings
+from app.core.security import utc_now
 from app.core.tracing import temporary_chat_tracing_enabled
+from app.integrations.base import ProviderBundle
 from app.models.conversation import Conversation
 from app.models.itinerary import Itinerary
 from app.models.message import Message
 from app.models.trip import Trip
+from app.schemas.common import PriceQuote
+from app.schemas.transport import RouteLeg
+from app.schemas.trip import TripRequirements, TripResponse
+from app.services.route_service import ordered_route_stops
 from app.services.temporary_chat_service import TEMPORARY_CHAT_KEY_PREFIX
+from app.utils.datetime_utils import INDIA_TIME_ZONE
 
 
 def _session_id() -> str:
@@ -39,7 +50,8 @@ async def test_guest_temporary_chat_uses_redis_only_and_expires(
     assistant_summary = body["assistant_message"]
     assert assistant_summary.startswith("Feasibility: unknown.")
     assert "Main reason:" in assistant_summary
-    assert "Known cost is INR 10,500 against a budget of INR 15,000." in assistant_summary
+    assert "Estimated range is INR" in assistant_summary
+    assert "against a budget of INR 15,000" in assistant_summary
     assert 2 <= assistant_summary.count(". ") + assistant_summary.endswith(".") <= 3
     assert len(assistant_summary) <= 320
     assert body["temp_token"]
@@ -193,3 +205,82 @@ async def test_temporary_chat_rate_limits_per_ip_and_session(
 def test_temporary_chat_tracing_is_always_disabled(settings: Settings) -> None:
     settings.langsmith_tracing = True
     assert temporary_chat_tracing_enabled(settings) is False
+
+
+class _TemporaryVagueIntent:
+    async def extract_requirements(
+        self,
+        *,
+        user_prompt: str,
+        previous_trip: TripResponse | None,
+    ) -> TripRequirements:
+        del user_prompt, previous_trip
+        return TripRequirements(
+            origin="Hyderabad",
+            destinations=["Delhi"],
+            ambiguities=["Travelers not specified; assuming 1."],
+        )
+
+
+class _TemporaryStaticMaps:
+    async def route_legs(self, requirements: TripRequirements) -> list[RouteLeg]:
+        stops = ordered_route_stops(requirements)
+        return [
+            RouteLeg(
+                origin=origin,
+                destination=destination,
+                mode="road",
+                duration_minutes=960,
+                duration_source="osrm",
+                distance_km=Decimal("1500"),
+                great_circle_distance_km=Decimal("1255"),
+                price=PriceQuote(
+                    amount=Decimal("18000"),
+                    price_type="estimate",
+                    source="fuel_formula",
+                    fetched_at=utc_now(),
+                ),
+            )
+            for origin, destination in zip(stops, stops[1:], strict=False)
+        ]
+
+
+@pytest.mark.asyncio
+async def test_temporary_vague_prompt_gets_same_estimates_without_persistence(
+    app: FastAPI,
+    client: AsyncClient,
+    db_session: AsyncSession,
+    settings: Settings,
+) -> None:
+    fixed_now = datetime(2026, 11, 2, 9, 0, tzinfo=INDIA_TIME_ZONE)
+
+    def providers(fetched_at: datetime) -> ProviderBundle:
+        return ProviderBundle.stubs(fetched_at).with_maps(
+            _TemporaryStaticMaps(),
+            source_name="osrm",
+        )
+
+    app.state.trip_planner = LangGraphTripPlanner(
+        settings,
+        intent_model=_TemporaryVagueIntent(),
+        provider_factory=providers,
+        now_provider=lambda: fixed_now,
+    )
+    response = await client.post(
+        "/api/v1/chat/temporary",
+        json={
+            "temp_session_id": _session_id(),
+            "content": "Hyderabad se Delhi jana hai",
+        },
+    )
+
+    assert response.status_code == 200
+    trip = response.json()["trip"]
+    assert trip["status"] == "completed"
+    assert trip["mode_comparison"]
+    assert any(item["recommended"] is True for item in trip["mode_comparison"])
+    assert trip["budget"]["estimated_total_min"] is not None
+    assert await db_session.scalar(select(func.count(Conversation.id))) == 0
+    assert await db_session.scalar(select(func.count(Message.id))) == 0
+    assert await db_session.scalar(select(func.count(Trip.id))) == 0
+    assert await db_session.scalar(select(func.count(Itinerary.id))) == 0

@@ -12,24 +12,13 @@ INFEASIBLE_ALTERNATIVES = (
     "Alternative 3: Drop a destination.",
     "Alternative 4: Increase the budget.",
 )
-ASSUMPTION_PREFIXES = (
-    "Travelers not specified;",
-    "Return time not specified;",
-    "Schedule start shifted",
-)
-
-
 def _ordered_warnings(
     *,
     errors: list[str],
     details: list[str],
 ) -> list[str]:
-    assumptions = [warning for warning in details if warning.startswith(ASSUMPTION_PREFIXES)]
-    supporting_details = [
-        warning for warning in details if not warning.startswith(ASSUMPTION_PREFIXES)
-    ]
     alternatives = list(INFEASIBLE_ALTERNATIVES) if errors else []
-    return list(dict.fromkeys([*errors, *assumptions, *supporting_details, *alternatives]))
+    return list(dict.fromkeys([*errors, *details, *alternatives]))
 
 
 def build_response_node(settings: Settings) -> Any:
@@ -48,6 +37,8 @@ def build_response_node(settings: Settings) -> Any:
             requirements=requirements,
             feasible=state["feasible"],
             warnings=warnings,
+            assumptions=state["assumptions"],
+            suggested_followups=state["suggested_followups"],
             route_legs=state["route_options"],
             transport_options=state["transport_options"],
             hotels=state["hotels"],
@@ -61,6 +52,7 @@ def build_response_node(settings: Settings) -> Any:
                 state["route_options"],
                 state["hotels"],
             ),
+            mode_comparison=state["mode_comparison"],
         )
         return {
             "status": response.status,

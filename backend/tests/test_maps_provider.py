@@ -255,6 +255,16 @@ async def _run_road_plan(
         update={
             "maps_provider": "osm",
             "min_stay_hours_per_destination": min_stay_hours,
+            "estimate_train_sleeper_inr_per_km": Decimal("100"),
+            "estimate_train_3ac_inr_per_km": Decimal("150"),
+            "estimate_train_2ac_inr_per_km": Decimal("200"),
+            "estimate_bus_ordinary_inr_per_km": Decimal("100"),
+            "estimate_bus_ac_inr_per_km": Decimal("150"),
+            "estimate_bus_sleeper_inr_per_km": Decimal("200"),
+            "estimate_train_speed_min_kmph": Decimal("1"),
+            "estimate_train_speed_max_kmph": Decimal("1"),
+            "estimate_bus_speed_min_kmph": Decimal("1"),
+            "estimate_bus_speed_max_kmph": Decimal("1"),
         }
     )
     requirements = TripRequirements(
@@ -420,8 +430,7 @@ async def test_long_road_route_uses_multi_day_schedule_and_misses_deadline(
         "Alternative 4: Increase the budget.",
     ]
     assert (
-        "Road estimates drive feasibility; official train, bus, and flight search pages are "
-        "included as alternatives."
+        "Rates are configurable estimates; verify fares, schedules, and availability."
         in response.warnings
     )
     assert (
@@ -432,27 +441,31 @@ async def test_long_road_route_uses_multi_day_schedule_and_misses_deadline(
         "OSRM durations exclude traffic, so real travel time may be longer."
         in response.warnings
     )
-    assert len(response.transport_options) == len(response.route_legs)
-    for option, leg in zip(response.transport_options, response.route_legs, strict=True):
+    road_options = [
+        option for option in response.transport_options if option.mode == "road"
+    ]
+    assert len(response.transport_options) == len(response.route_legs) * 4
+    for option, leg in zip(road_options, response.route_legs, strict=True):
         assert option.origin == leg.origin
         assert option.destination == leg.destination
-        assert option.provider == "osrm+fuel_formula"
+        assert option.provider == "distance_formula"
         assert option.distance_km == leg.distance_km
-        assert option.duration_minutes == leg.duration_minutes
+        assert option.duration_minutes_min == leg.duration_minutes
+        assert option.duration_minutes_max == leg.duration_minutes
         assert option.price == leg.price
         assert option.price.price_type == "estimate"
 
     rest_stays = [
         hotel
         for hotel in response.hotels
-        if hotel.name.startswith("Overnight rest stop between")
+        if hotel.destination == "en route"
     ]
     assert rest_stays
     assert all(hotel.destination == "en route" for hotel in rest_stays)
     assert all(hotel.destination != response.requirements.origin for hotel in response.hotels)
     assert all(hotel.check_out > hotel.check_in for hotel in response.hotels)
     assert all(hotel.total_price.price_type == "estimate" for hotel in rest_stays)
-    assert all(hotel.total_price.source == "stub_overnight_rest_estimate" for hotel in rest_stays)
+    assert all(hotel.total_price.source == "tier_assumption" for hotel in rest_stays)
 
     assert all(day.activities for day in response.itinerary_days)
     assert response.itinerary_days[0].destination == "en route"
@@ -484,9 +497,10 @@ async def test_short_verified_road_route_is_feasible(settings: Settings) -> None
     assert response.route_legs[-1].arrival_at == datetime(
         2026, 10, 30, 16, tzinfo=INDIA_TIME_ZONE
     )
-    assert response.budget.known_subtotal >= Decimal("2400.00")
+    assert response.budget.estimated_total_min is not None
+    assert response.budget.estimated_total_min >= Decimal("2400.00")
     assert response.data_sources[0].name == "osrm"
-    assert all(option.provider == "osrm+fuel_formula" for option in response.transport_options)
+    assert all(option.provider == "distance_formula" for option in response.transport_options)
 
 
 @pytest.mark.asyncio
@@ -523,11 +537,19 @@ async def test_same_day_start_uses_next_sensible_slot_and_warns(settings: Settin
     assert (stay.ends_at - stay.starts_at).total_seconds() >= 6 * 3600
     next_leg = response.route_legs[1]
     assert next_leg.departure_at == stay.ends_at
-    destination_hotel = next(
+    destination_hotels = [
         hotel for hotel in response.hotels if hotel.destination == "Puducherry"
+    ]
+    assert {hotel.tier for hotel in destination_hotels} == {
+        "budget",
+        "standard",
+        "comfort",
+    }
+    assert all(hotel.check_in == stay.starts_at.date() for hotel in destination_hotels)
+    assert all(
+        hotel.check_out == next_leg.departure_at.date()
+        for hotel in destination_hotels
     )
-    assert destination_hotel.check_in == stay.starts_at.date()
-    assert destination_hotel.check_out == next_leg.departure_at.date()
 
 
 @pytest.mark.asyncio

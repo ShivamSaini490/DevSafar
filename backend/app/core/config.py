@@ -50,11 +50,20 @@ class Settings(BaseSettings):
     postgres_password: SecretStr = SecretStr("replace-with-local-dev-password")
 
     redis_url: SecretStr = SecretStr("redis://127.0.0.1:6379/0")
+    redis_socket_timeout_seconds: float = Field(default=10.0, gt=0, le=120)
 
     groq_api_key: SecretStr | None = None
     groq_model: str = "llama-3.3-70b-versatile"
     groq_extraction_model: str = ""
     groq_extraction_fallback_model: str = ""
+    groq_extraction_max_completion_tokens: int = Field(default=4096, ge=256, le=65_536)
+    groq_extraction_retry_max_completion_tokens: int = Field(
+        default=8192,
+        ge=512,
+        le=65_536,
+    )
+    groq_extraction_reasoning_effort: Literal["low", "medium", "high"] = "low"
+    groq_extraction_include_reasoning: bool = False
     groq_timeout_seconds: float = Field(default=30.0, gt=0, le=60)
     groq_max_retry_wait_seconds: float = Field(default=8.0, ge=0, le=60)
     graph_timeout_seconds: float = Field(default=60.0, gt=0, le=180)
@@ -70,6 +79,22 @@ class Settings(BaseSettings):
     maps_allowed_hosts: str = "router.project-osrm.org,nominatim.openstreetmap.org"
     maps_http_timeout_seconds: float = Field(default=10.0, gt=0, le=60)
     geocode_cache_ttl_seconds: int = Field(default=2_592_000, ge=86_400)
+    google_serp_api_key: SecretStr | None = None
+    serpapi_enabled: bool = False
+    serpapi_base_url: str = "https://serpapi.com/search.json"
+    serpapi_allowed_hosts: str = "serpapi.com,www.serpapi.com"
+    serpapi_timeout_seconds: float = Field(default=15.0, gt=0, le=60)
+    serpapi_max_retries: int = Field(default=2, ge=0, le=2)
+    serpapi_max_retry_wait_seconds: float = Field(default=5.0, ge=0, le=30)
+    serpapi_auth_circuit_minutes: int = Field(default=10, ge=1, le=120)
+    serpapi_monthly_budget: int = Field(default=250, ge=0)
+    serpapi_max_searches_per_trip: int = Field(default=3, ge=0, le=20)
+    flight_cache_ttl_seconds: int = Field(default=900, ge=60, le=86_400)
+    hotel_cache_ttl_seconds: int = Field(default=1800, ge=60, le=86_400)
+    price_history_enabled: bool = True
+    price_history_max_age_days: int = Field(default=90, ge=1, le=3650)
+    price_history_retention_days: int = Field(default=180, ge=1, le=3650)
+    allow_demo_price_data: bool = False
     tavily_enabled: bool = False
     tavily_api_key: SecretStr | None = None
     tavily_base_url: str = "https://api.tavily.com"
@@ -88,6 +113,47 @@ class Settings(BaseSettings):
         "www.irctc.co.in,www.makemytrip.com,www.redbus.in,www.google.com,www.booking.com"
     )
     fuel_cost_per_km: Decimal = Field(default=Decimal("12.00"), gt=0)
+    estimate_train_sleeper_inr_per_km: Decimal = Field(default=Decimal("0.75"), gt=0)
+    estimate_train_3ac_inr_per_km: Decimal = Field(default=Decimal("1.50"), gt=0)
+    estimate_train_2ac_inr_per_km: Decimal = Field(default=Decimal("2.25"), gt=0)
+    estimate_bus_ordinary_inr_per_km: Decimal = Field(default=Decimal("1.20"), gt=0)
+    estimate_bus_ac_inr_per_km: Decimal = Field(default=Decimal("2.00"), gt=0)
+    estimate_bus_sleeper_inr_per_km: Decimal = Field(default=Decimal("2.50"), gt=0)
+    estimate_flight_base_min_inr: Decimal = Field(default=Decimal("2500"), gt=0)
+    estimate_flight_base_max_inr: Decimal = Field(default=Decimal("4500"), gt=0)
+    estimate_flight_per_km_min_inr: Decimal = Field(default=Decimal("3.00"), gt=0)
+    estimate_flight_per_km_max_inr: Decimal = Field(default=Decimal("7.00"), gt=0)
+    estimate_flight_min_fare_min_inr: Decimal = Field(default=Decimal("3000"), gt=0)
+    estimate_flight_min_fare_max_inr: Decimal = Field(default=Decimal("5000"), gt=0)
+    estimate_road_speed_min_kmph: Decimal = Field(default=Decimal("40"), gt=0)
+    estimate_road_speed_max_kmph: Decimal = Field(default=Decimal("65"), gt=0)
+    estimate_train_speed_min_kmph: Decimal = Field(default=Decimal("45"), gt=0)
+    estimate_train_speed_max_kmph: Decimal = Field(default=Decimal("70"), gt=0)
+    estimate_bus_speed_min_kmph: Decimal = Field(default=Decimal("35"), gt=0)
+    estimate_bus_speed_max_kmph: Decimal = Field(default=Decimal("55"), gt=0)
+    estimate_flight_speed_min_kmph: Decimal = Field(default=Decimal("650"), gt=0)
+    estimate_flight_speed_max_kmph: Decimal = Field(default=Decimal("800"), gt=0)
+    estimate_train_overhead_min_hours: Decimal = Field(default=Decimal("1"), ge=0)
+    estimate_train_overhead_max_hours: Decimal = Field(default=Decimal("2"), ge=0)
+    estimate_bus_overhead_min_hours: Decimal = Field(default=Decimal("0.5"), ge=0)
+    estimate_bus_overhead_max_hours: Decimal = Field(default=Decimal("1"), ge=0)
+    estimate_flight_overhead_min_hours: Decimal = Field(default=Decimal("3"), ge=0)
+    estimate_flight_overhead_max_hours: Decimal = Field(default=Decimal("5"), ge=0)
+    estimate_train_distance_threshold_km: Decimal = Field(default=Decimal("100"), ge=0)
+    estimate_hotel_budget_min_inr: Decimal = Field(default=Decimal("1000"), gt=0)
+    estimate_hotel_budget_max_inr: Decimal = Field(default=Decimal("1800"), gt=0)
+    estimate_hotel_standard_min_inr: Decimal = Field(default=Decimal("2000"), gt=0)
+    estimate_hotel_standard_max_inr: Decimal = Field(default=Decimal("3500"), gt=0)
+    estimate_hotel_comfort_min_inr: Decimal = Field(default=Decimal("4000"), gt=0)
+    estimate_hotel_comfort_max_inr: Decimal = Field(default=Decimal("6500"), gt=0)
+    estimate_food_min_per_day_per_traveler: Decimal = Field(default=Decimal("400"), ge=0)
+    estimate_food_max_per_day_per_traveler: Decimal = Field(default=Decimal("800"), ge=0)
+    estimate_local_transport_min_per_day_per_traveler: Decimal = Field(
+        default=Decimal("250"), ge=0
+    )
+    estimate_local_transport_max_per_day_per_traveler: Decimal = Field(
+        default=Decimal("600"), ge=0
+    )
     max_driving_hours_per_day: int = Field(default=10, ge=1, le=16)
     driving_latest_arrival_hour: int = Field(default=21, ge=7, le=23)
     min_stay_hours_per_destination: int = Field(default=6, ge=1, le=48)
@@ -250,7 +316,44 @@ class Settings(BaseSettings):
             self.tavily_base_url,
             allowed_hosts=tavily_allowed_hosts,
         )
+        serpapi_allowed_hosts = parse_host_allowlist(self.serpapi_allowed_hosts)
+        self.serpapi_base_url = validate_external_base_url(
+            self.serpapi_base_url,
+            allowed_hosts=serpapi_allowed_hosts,
+        )
+        if self.price_history_retention_days < self.price_history_max_age_days:
+            raise ValueError(
+                "PRICE_HISTORY_RETENTION_DAYS must be >= PRICE_HISTORY_MAX_AGE_DAYS"
+            )
         parse_host_allowlist(self.booking_allowed_hosts)
+        if (
+            self.groq_extraction_retry_max_completion_tokens
+            <= self.groq_extraction_max_completion_tokens
+        ):
+            raise ValueError(
+                "GROQ_EXTRACTION_RETRY_MAX_COMPLETION_TOKENS must be greater than "
+                "GROQ_EXTRACTION_MAX_COMPLETION_TOKENS"
+            )
+        estimate_ranges = (
+            ("flight base fare", self.estimate_flight_base_min_inr, self.estimate_flight_base_max_inr),
+            ("flight per-km rate", self.estimate_flight_per_km_min_inr, self.estimate_flight_per_km_max_inr),
+            ("flight minimum fare", self.estimate_flight_min_fare_min_inr, self.estimate_flight_min_fare_max_inr),
+            ("road speed", self.estimate_road_speed_min_kmph, self.estimate_road_speed_max_kmph),
+            ("train speed", self.estimate_train_speed_min_kmph, self.estimate_train_speed_max_kmph),
+            ("bus speed", self.estimate_bus_speed_min_kmph, self.estimate_bus_speed_max_kmph),
+            ("flight speed", self.estimate_flight_speed_min_kmph, self.estimate_flight_speed_max_kmph),
+            ("train overhead", self.estimate_train_overhead_min_hours, self.estimate_train_overhead_max_hours),
+            ("bus overhead", self.estimate_bus_overhead_min_hours, self.estimate_bus_overhead_max_hours),
+            ("flight overhead", self.estimate_flight_overhead_min_hours, self.estimate_flight_overhead_max_hours),
+            ("budget hotel", self.estimate_hotel_budget_min_inr, self.estimate_hotel_budget_max_inr),
+            ("standard hotel", self.estimate_hotel_standard_min_inr, self.estimate_hotel_standard_max_inr),
+            ("comfort hotel", self.estimate_hotel_comfort_min_inr, self.estimate_hotel_comfort_max_inr),
+            ("food", self.estimate_food_min_per_day_per_traveler, self.estimate_food_max_per_day_per_traveler),
+            ("local transport", self.estimate_local_transport_min_per_day_per_traveler, self.estimate_local_transport_max_per_day_per_traveler),
+        )
+        for label, minimum, maximum in estimate_ranges:
+            if minimum > maximum:
+                raise ValueError(f"Estimate {label} minimum cannot exceed maximum")
         return self
 
     @property
@@ -264,6 +367,10 @@ class Settings(BaseSettings):
     @property
     def tavily_excluded_domain_set(self) -> frozenset[str]:
         return parse_host_allowlist(self.tavily_excluded_domains)
+
+    @property
+    def serpapi_host_allowlist(self) -> frozenset[str]:
+        return parse_host_allowlist(self.serpapi_allowed_hosts)
 
     @property
     def booking_host_allowlist(self) -> frozenset[str]:
@@ -280,6 +387,22 @@ class Settings(BaseSettings):
             and self.tavily_api_key is not None
             and self.tavily_api_key.get_secret_value().strip()
         )
+
+    @property
+    def serpapi_configured(self) -> bool:
+        return bool(
+            self.serpapi_enabled
+            and self.google_serp_api_key is not None
+            and self.google_serp_api_key.get_secret_value().strip()
+        )
+
+    def serpapi_configuration_warnings(self) -> tuple[str, ...]:
+        if self.serpapi_enabled and not self.serpapi_configured:
+            return (
+                "SERPAPI_ENABLED is true but GOOGLE_SERP_API_KEY is empty; "
+                "prices will use history or formula fallback.",
+            )
+        return ()
 
     def tavily_configuration_warnings(self) -> tuple[str, ...]:
         if self.tavily_enabled and not self.tavily_configured:
@@ -407,6 +530,7 @@ class Settings(BaseSettings):
         optional_secrets = (
             self.secret_key,
             self.groq_api_key,
+            self.google_serp_api_key,
             self.tavily_api_key,
             self.qdrant_api_key,
             self.smtp_password,

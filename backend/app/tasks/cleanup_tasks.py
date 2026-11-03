@@ -16,10 +16,22 @@ async def run_cleanup_once(
     redis: Redis,
     *,
     batch_size: int,
+    price_history_retention_days: int = 180,
 ) -> CleanupCounts:
     async with session_factory() as session:
         counts = await CleanupService(session, redis=redis).delete_expired_conversations(
             batch_size=batch_size
+        )
+        history_count = await CleanupService(session, redis=redis).delete_expired_price_history(
+            retention_days=price_history_retention_days
+        )
+        counts = CleanupCounts(
+            conversations=counts.conversations,
+            messages=counts.messages,
+            trips=counts.trips,
+            itineraries=counts.itineraries,
+            redis_streams=counts.redis_streams,
+            price_history=history_count,
         )
     logger.info(
         "Expired conversation cleanup completed",
@@ -29,6 +41,7 @@ async def run_cleanup_once(
             "deleted_trips": counts.trips,
             "deleted_itineraries": counts.itineraries,
             "deleted_redis_streams": counts.redis_streams,
+            "deleted_price_history": counts.price_history,
         },
     )
     return counts
@@ -45,6 +58,7 @@ async def run_cleanup_loop(
                 session_factory,
                 redis,
                 batch_size=settings.cleanup_batch_size,
+                price_history_retention_days=settings.price_history_retention_days,
             )
         except asyncio.CancelledError:
             raise

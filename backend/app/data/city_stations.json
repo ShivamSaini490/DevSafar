@@ -1,0 +1,15 @@
+[
+  {"city": "Hyderabad", "state": "Telangana", "station_available_for": ["Hyderabad", "Secunderabad"]},
+  {"city": "Delhi", "state": "Delhi", "station_available_for": ["Delhi", "New Delhi"]},
+  {"city": "Mumbai", "state": "Maharashtra", "station_available_for": ["Mumbai", "Navi Mumbai"]},
+  {"city": "Bengaluru", "state": "Karnataka", "station_available_for": ["Bengaluru", "Bangalore"]},
+  {"city": "Chennai", "state": "Tamil Nadu", "station_available_for": ["Chennai"]},
+  {"city": "Puducherry", "state": "Puducherry", "station_available_for": ["Puducherry", "Pondicherry"]},
+  {"city": "Rameswaram", "state": "Tamil Nadu", "station_available_for": ["Rameswaram", "Rameshwaram"]},
+  {"city": "Vijayawada", "state": "Andhra Pradesh", "station_available_for": ["Vijayawada"]},
+  {"city": "Kolkata", "state": "West Bengal", "station_available_for": ["Kolkata", "Howrah"]},
+  {"city": "Kochi", "state": "Kerala", "station_available_for": ["Kochi", "Cochin", "Ernakulam"]},
+  {"city": "Pune", "state": "Maharashtra", "station_available_for": ["Pune"]},
+  {"city": "Ahmedabad", "state": "Gujarat", "station_available_for": ["Ahmedabad"]},
+  {"city": "Jaipur", "state": "Rajasthan", "station_available_for": ["Jaipur"]}
+]

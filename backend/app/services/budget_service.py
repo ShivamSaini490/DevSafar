@@ -7,7 +7,7 @@ from app.schemas.attraction import AttractionOption
 from app.schemas.budget import BudgetBreakdown, BudgetCategory
 from app.schemas.hotel import HotelOption
 from app.schemas.transport import RouteLeg, TransportOption
-from app.schemas.trip import TripRequirements
+from app.schemas.trip import ModeComparison, TripRequirements
 from app.utils.currency_utils import all_amounts_known, sum_known_amounts
 
 
@@ -36,6 +36,206 @@ def _priced_category(
 
 
 class BudgetService:
+    @staticmethod
+    def build_estimated_range(
+        *,
+        comparison: ModeComparison | None,
+        hotel_total_min: Decimal,
+        hotel_total_max: Decimal,
+        food_total_min: Decimal,
+        food_total_max: Decimal,
+        local_transport_total_min: Decimal,
+        local_transport_total_max: Decimal,
+        attractions: list[AttractionOption],
+        fetched_at: datetime,
+    ) -> BudgetBreakdown:
+        categories: list[BudgetCategory] = []
+        transport_min, transport_max = (
+            _price_bounds(comparison.transport_price)
+            if comparison is not None
+            else (None, None)
+        )
+        if transport_min is None or transport_max is None:
+            categories.append(
+                BudgetCategory(
+                    name="Transport",
+                    amount=None,
+                    price_type="unknown",
+                    source="distance_formula",
+                    fetched_at=fetched_at,
+                    status="unavailable",
+                    provider="price_engine",
+                    observed_at=fetched_at,
+                    price_unit="trip transport total",
+                )
+            )
+        else:
+            categories.append(
+                BudgetCategory(
+                    name="Transport",
+                    amount_min=transport_min,
+                    amount_max=transport_max,
+                    price_type=(
+                        "live_quote"
+                        if comparison is not None
+                        and comparison.transport_price.status == "live_search_result"
+                        else "estimate"
+                    ),
+                    source=(
+                        comparison.transport_price.source
+                        if comparison is not None
+                        else "distance_formula"
+                    ),
+                    fetched_at=fetched_at,
+                    status=(
+                        comparison.transport_price.status
+                        if comparison is not None
+                        else "formula_estimate"
+                    ),
+                    provider=(
+                        comparison.transport_price.provider
+                        if comparison is not None
+                        else "distance_formula"
+                    ),
+                    observed_at=(
+                        comparison.transport_price.observed_at
+                        if comparison is not None
+                        else fetched_at
+                    ),
+                    price_unit="trip transport total",
+                    note=(comparison.transport_price.note if comparison is not None else None),
+                )
+            )
+        categories.extend(
+            [
+                BudgetCategory(
+                    name="Hotels",
+                    amount_min=hotel_total_min,
+                    amount_max=hotel_total_max,
+                    price_type="estimate",
+                    source="tier_assumption",
+                    fetched_at=fetched_at,
+                ),
+                BudgetCategory(
+                    name="Food",
+                    amount_min=food_total_min,
+                    amount_max=food_total_max,
+                    price_type="estimate",
+                    source="configured_rule",
+                    fetched_at=fetched_at,
+                ),
+                BudgetCategory(
+                    name="Local transport",
+                    amount_min=local_transport_total_min,
+                    amount_max=local_transport_total_max,
+                    price_type="estimate",
+                    source="configured_rule",
+                    fetched_at=fetched_at,
+                ),
+            ]
+        )
+        known_attraction_amounts = [
+            item.entry_fee.amount
+            for item in attractions
+            if item.entry_fee.amount is not None
+        ]
+        known_attraction_total = sum_known_amounts(known_attraction_amounts)
+        if known_attraction_amounts:
+            categories.append(
+                BudgetCategory(
+                    name="Attractions",
+                    amount=known_attraction_total,
+                    price_type="estimate",
+                    source="provider_sources",
+                    fetched_at=fetched_at,
+                )
+            )
+        if len(known_attraction_amounts) != len(attractions):
+            categories.append(
+                BudgetCategory(
+                    name=(
+                        "Attractions"
+                        if not known_attraction_amounts
+                        else "Attractions (unpriced entries)"
+                    ),
+                    amount=None,
+                    price_type="unknown",
+                    source="provider_sources",
+                    fetched_at=fetched_at,
+                )
+            )
+        known_subtotal = sum_known_amounts(
+            category.amount if category.amount is not None else category.amount_min
+            for category in categories
+        )
+        unknown_categories = [
+            category.name for category in categories if category.price_type == "unknown"
+        ]
+        numeric = [
+            (category.amount, category.amount)
+            if category.amount is not None
+            else (category.amount_min, category.amount_max)
+            for category in categories
+            if category.amount is not None
+            or (category.amount_min is not None and category.amount_max is not None)
+        ]
+        estimated_min = sum((item[0] or Decimal("0") for item in numeric), Decimal("0")).quantize(
+            Decimal("0.01"), rounding=ROUND_HALF_UP
+        )
+        estimated_max = sum((item[1] or Decimal("0") for item in numeric), Decimal("0")).quantize(
+            Decimal("0.01"), rounding=ROUND_HALF_UP
+        )
+        live_numeric = [
+            (category.amount, category.amount)
+            if category.amount is not None
+            else (category.amount_min, category.amount_max)
+            for category in categories
+            if category.status == "live_search_result"
+            and (
+                category.amount is not None
+                or (category.amount_min is not None and category.amount_max is not None)
+            )
+        ]
+        estimate_numeric = [
+            (category.amount, category.amount)
+            if category.amount is not None
+            else (category.amount_min, category.amount_max)
+            for category in categories
+            if category.status in {"previous", "estimated", "formula_estimate"}
+            and (
+                category.amount is not None
+                or (category.amount_min is not None and category.amount_max is not None)
+            )
+        ]
+        live_total = sum(
+            (item[0] or Decimal("0") for item in live_numeric), Decimal("0")
+        )
+        estimate_min = sum(
+            (item[0] or Decimal("0") for item in estimate_numeric), Decimal("0")
+        )
+        estimate_max = sum(
+            (item[1] or Decimal("0") for item in estimate_numeric), Decimal("0")
+        )
+        has_live = any(category.status == "live_search_result" for category in categories)
+        has_estimate = any(
+            category.status in {"previous", "estimated", "formula_estimate"}
+            for category in categories
+        )
+        return BudgetBreakdown(
+            total_estimated=None,
+            estimated_total_min=estimated_min if numeric else None,
+            estimated_total_max=estimated_max if numeric else None,
+            known_subtotal=known_subtotal,
+            unknown_categories=unknown_categories,
+            omitted_categories=unknown_categories,
+            live_based_total=live_total if has_live else None,
+            estimate_based_total_min=estimate_min if has_estimate else None,
+            estimate_based_total_max=estimate_max if has_estimate else None,
+            mixed_confidence=has_live and has_estimate,
+            price_type="estimate" if numeric else "unknown",
+            categories=categories,
+        )
+
     @staticmethod
     def build(
         *,
@@ -146,6 +346,7 @@ class BudgetService:
                 total_estimated=None,
                 known_subtotal=known_subtotal,
                 unknown_categories=unknown_categories,
+                omitted_categories=unknown_categories,
                 price_type="unknown",
                 categories=categories,
             )
@@ -153,6 +354,14 @@ class BudgetService:
             total_estimated=known_subtotal,
             known_subtotal=known_subtotal,
             unknown_categories=[],
+            omitted_categories=[],
             price_type="estimate",
             categories=categories,
         )
+
+
+def _price_bounds(quote: object) -> tuple[Decimal | None, Decimal | None]:
+    amount = getattr(quote, "amount", None)
+    if amount is not None:
+        return amount, amount
+    return getattr(quote, "amount_min", None), getattr(quote, "amount_max", None)

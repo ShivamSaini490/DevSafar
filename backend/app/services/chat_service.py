@@ -43,7 +43,7 @@ def summarize_trip(response: TripResponse) -> str:
             (
                 warning
                 for warning in response.warnings
-                if warning.startswith("Feasibility cannot be verified")
+                if warning.startswith("Feasibility")
             ),
             "provider-backed timing or pricing is incomplete",
         )
@@ -51,14 +51,32 @@ def summarize_trip(response: TripResponse) -> str:
     else:
         reason = "the verified schedule meets the current deadline and known constraints"
 
-    known_cost = _format_inr(response.budget.known_subtotal)
-    if response.requirements.budget is None:
-        cost_sentence = f"Known cost is INR {known_cost}; no budget was specified."
-    else:
-        cost_sentence = (
-            f"Known cost is INR {known_cost} against a budget of INR "
-            f"{_format_inr(response.requirements.budget)}."
+    if (
+        response.budget.estimated_total_min is not None
+        and response.budget.estimated_total_max is not None
+    ):
+        estimate_range = (
+            f"INR {_format_inr(response.budget.estimated_total_min)}-"
+            f"{_format_inr(response.budget.estimated_total_max)}"
         )
+        if response.requirements.budget is None:
+            cost_sentence = f"Suggested estimate range is {estimate_range}."
+        else:
+            cost_sentence = (
+                f"Estimated range is {estimate_range} against a budget of INR "
+                f"{_format_inr(response.requirements.budget)}."
+            )
+    else:
+        known_cost = _format_inr(response.budget.known_subtotal)
+        if response.budget.known_subtotal == 0 and response.budget.unknown_categories:
+            cost_sentence = "Cost estimate is unavailable until route pricing is known."
+        elif response.requirements.budget is None:
+            cost_sentence = f"Known cost is INR {known_cost}; no budget was specified."
+        else:
+            cost_sentence = (
+                f"Known cost is INR {known_cost} against a budget of INR "
+                f"{_format_inr(response.requirements.budget)}."
+            )
     clean_reason = reason.rstrip(".?!").lower()
     return f"Feasibility: {feasibility}. Main reason: {clean_reason}. {cost_sentence}"
 

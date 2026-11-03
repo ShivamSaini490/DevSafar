@@ -28,6 +28,7 @@ SETTINGS_ENVIRONMENT_VARIABLES = frozenset(
 LIVE_INTEGRATION_ENVIRONMENT_VARIABLES = frozenset(
     {
         "GROQ_API_KEY",
+        "GOOGLE_SERP_API_KEY",
         "QDRANT_API_KEY",
         "QDRANT_URL",
         "TAVILY_API_KEY",
@@ -104,7 +105,7 @@ class FakeIntentModel:
         )
         if "deadline miss" in lowered:
             requirements.return_deadline = datetime(
-                2026, 11, 1, 10, 0, tzinfo=INDIA_TIME_ZONE
+                2026, 10, 30, 6, 30, tzinfo=INDIA_TIME_ZONE
             )
         if "impossible budget" in lowered:
             requirements.budget = Decimal("100")
@@ -213,7 +214,7 @@ def app(settings: Settings, fake_intent_model: FakeIntentModel) -> FastAPI:
 async def clean_dependencies(settings: Settings) -> AsyncIterator[None]:
     engine = create_db_engine(settings)
     async with engine.begin() as connection:
-        await connection.execute(text("TRUNCATE TABLE users CASCADE"))
+        await connection.execute(text("TRUNCATE TABLE price_history, users CASCADE"))
     from app.db.session import create_redis_client
 
     redis = create_redis_client(settings)

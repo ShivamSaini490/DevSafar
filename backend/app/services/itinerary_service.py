@@ -1,5 +1,6 @@
 from collections import defaultdict
 from datetime import date, datetime, time, timedelta
+from decimal import ROUND_HALF_UP, Decimal
 
 from app.schemas.attraction import AttractionOption
 from app.schemas.itinerary import ItineraryActivity, ItineraryDay
@@ -9,6 +10,96 @@ from app.utils.datetime_utils import INDIA_TIME_ZONE, as_india_time, at_india_ti
 
 
 class ItineraryService:
+    @staticmethod
+    def build_estimated_mode(
+        requirements: TripRequirements,
+        route_legs: list[RouteLeg],
+    ) -> list[ItineraryDay]:
+        """Build date-only blocks for modes without verified timetables."""
+
+        if requirements.start_date is None or requirements.end_date is None:
+            return []
+        if not route_legs:
+            return []
+        leg_count = len(route_legs)
+        span_days = max(0, (requirements.end_date - requirements.start_date).days)
+        leg_dates = [
+            requirements.start_date
+            + timedelta(days=(index * span_days) // max(1, leg_count - 1))
+            for index in range(leg_count)
+        ]
+        activities_by_date: dict[date, list[ItineraryActivity]] = defaultdict(list)
+        destinations_by_date: dict[date, str] = {}
+        current_destination = requirements.origin or "Unknown"
+        for leg, travel_date in zip(route_legs, leg_dates, strict=True):
+            minimum = leg.duration_minutes_min
+            maximum = leg.duration_minutes_max
+            if minimum is not None and maximum is not None:
+                min_hours = (Decimal(minimum) / Decimal("60")).quantize(
+                    Decimal("0.1"), rounding=ROUND_HALF_UP
+                )
+                max_hours = (Decimal(maximum) / Decimal("60")).quantize(
+                    Decimal("0.1"), rounding=ROUND_HALF_UP
+                )
+                duration_label = f"approx {min_hours:f}-{max_hours:f} h"
+            else:
+                duration_label = "duration unknown"
+            activities_by_date[travel_date].append(
+                ItineraryActivity(
+                    title=f"Travel by {leg.mode} ({duration_label})",
+                    location=f"{leg.origin} to {leg.destination}",
+                    starts_at=None,
+                    ends_at=None,
+                    notes=(
+                        "No departure time, service number, or timetable is assumed; "
+                        "verify the actual schedule."
+                    ),
+                )
+            )
+            current_destination = leg.destination
+            destinations_by_date[travel_date] = current_destination
+            if (
+                requirements.origin is None
+                or current_destination.casefold() != requirements.origin.casefold()
+            ):
+                activities_by_date[travel_date].append(
+                    ItineraryActivity(
+                        title=f"Stay in {current_destination}",
+                        location=current_destination,
+                        starts_at=None,
+                        ends_at=None,
+                        notes="Date-only stay block; exact check-in time is not assumed.",
+                    )
+                )
+
+        days: list[ItineraryDay] = []
+        current_destination = requirements.origin or "Unknown"
+        day_date = requirements.start_date
+        day_number = 1
+        while day_date <= requirements.end_date:
+            if day_date in destinations_by_date:
+                current_destination = destinations_by_date[day_date]
+            activities = activities_by_date.get(day_date) or [
+                ItineraryActivity(
+                    title=f"Flexible/rest day in {current_destination}",
+                    location=current_destination,
+                    starts_at=None,
+                    ends_at=None,
+                    notes="No provider-backed activity time is assumed.",
+                )
+            ]
+            days.append(
+                ItineraryDay(
+                    day=day_number,
+                    date=day_date,
+                    destination=current_destination,
+                    activities=activities,
+                )
+            )
+            day_date += timedelta(days=1)
+            day_number += 1
+        return days
+
     @staticmethod
     def build(
         requirements: TripRequirements,

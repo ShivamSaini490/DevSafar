@@ -1,5 +1,8 @@
+import asyncio
 import json
+import logging
 import secrets
+from contextlib import suppress
 from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID, uuid4
@@ -8,6 +11,7 @@ import pytest
 from fastapi import FastAPI
 from httpx import AsyncClient
 from pydantic import SecretStr
+from redis.exceptions import ConnectionError as RedisConnectionError
 from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -275,6 +279,164 @@ async def test_stream_emits_heartbeat_without_events(settings: Settings) -> None
     assert await anext(generator) == ": heartbeat\n\n"
     await generator.aclose()
     await redis.aclose()
+
+
+class SlowResearchGraph:
+    async def run(self, progress_callback: Any) -> None:
+        await progress_callback("intent", "started")
+        await progress_callback("intent", "completed")
+        await progress_callback("research", "started")
+        await asyncio.sleep(1.2)
+        await progress_callback("research", "completed")
+
+
+@pytest.mark.asyncio
+async def test_slow_stage_outlives_socket_timeout_and_stream_completes(
+    settings: Settings,
+) -> None:
+    configured = settings.model_copy(
+        update={
+            "redis_socket_timeout_seconds": 0.05,
+            "planning_stream_heartbeat_seconds": 1,
+            "planning_stream_max_seconds": 10,
+        }
+    )
+    redis = create_redis_client(configured)
+    streams = PlanningStreamStore(redis, configured)
+    trip_id = uuid4()
+    await streams.create_temporary(
+        trip_id=trip_id,
+        temp_session_id=secrets.token_urlsafe(32),
+        temp_token=secrets.token_urlsafe(32),
+    )
+    graph = SlowResearchGraph()
+
+    async def produce() -> None:
+        await graph.run(
+            lambda stage, status: streams.publish_progress(trip_id, stage, status)
+        )
+        await streams.publish_completed(trip_id)
+
+    producer = asyncio.create_task(produce())
+    chunks = [
+        chunk
+        async for chunk in streams.event_stream(trip_id, last_event_id=None)
+    ]
+    await producer
+    await redis.aclose()
+
+    events = _sse_events("".join(chunks))
+    assert any(chunk == ": heartbeat\n\n" for chunk in chunks)
+    assert any(
+        event.get("stage") == "research" and event.get("status") == "completed"
+        for _, event in events
+    )
+    assert events[-1][1] == {"event": "completed", "trip_id": str(trip_id)}
+
+
+@pytest.mark.asyncio
+async def test_stream_client_disconnect_mid_wait_closes_without_error_log(
+    settings: Settings,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    configured = settings.model_copy(
+        update={
+            "redis_socket_timeout_seconds": 0.05,
+            "planning_stream_heartbeat_seconds": 1,
+            "planning_stream_max_seconds": 10,
+        }
+    )
+    redis = create_redis_client(configured)
+    streams = PlanningStreamStore(redis, configured)
+    trip_id = uuid4()
+    await streams.create_temporary(
+        trip_id=trip_id,
+        temp_session_id=secrets.token_urlsafe(32),
+        temp_token=secrets.token_urlsafe(32),
+    )
+
+    generator = streams.event_stream(trip_id, last_event_id=None)
+    with caplog.at_level(logging.WARNING):
+        pending = asyncio.create_task(anext(generator))
+        await asyncio.sleep(0.05)
+        pending.cancel()
+        with suppress(asyncio.CancelledError, StopAsyncIteration):
+            await pending
+        await generator.aclose()
+    await redis.aclose()
+
+    assert not any(
+        record.getMessage() == "Planning stream Redis read failed"
+        for record in caplog.records
+    )
+
+
+class RedisConnectionLoss:
+    def __init__(self, redis: Any) -> None:
+        self.redis = redis
+        self.calls = 0
+
+    async def xread(self, *args: Any, **kwargs: Any) -> Any:
+        self.calls += 1
+        if self.calls == 1:
+            return await self.redis.xread(*args, **kwargs)
+        raise RedisConnectionError("simulated connection loss")
+
+
+@pytest.mark.asyncio
+async def test_redis_connection_loss_mid_stream_emits_failed_event(
+    settings: Settings,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    configured = settings.model_copy(
+        update={
+            "redis_socket_timeout_seconds": 1,
+            "planning_stream_heartbeat_seconds": 1,
+            "planning_stream_max_seconds": 10,
+        }
+    )
+    redis = create_redis_client(configured)
+    trip_id = uuid4()
+    streams = PlanningStreamStore(redis, configured)
+    await streams.create_temporary(
+        trip_id=trip_id,
+        temp_session_id=secrets.token_urlsafe(32),
+        temp_token=secrets.token_urlsafe(32),
+    )
+    await streams.publish_progress(trip_id, "intent", "started")
+    broken_reader = RedisConnectionLoss(redis)
+    broken_streams = PlanningStreamStore(
+        redis,
+        configured,
+        blocking_redis=broken_reader,  # type: ignore[arg-type]
+    )
+
+    with caplog.at_level(logging.WARNING):
+        chunks = [
+            chunk
+            async for chunk in broken_streams.event_stream(
+                trip_id,
+                last_event_id=None,
+            )
+        ]
+    await redis.aclose()
+
+    events = _sse_events("".join(chunks))
+    assert events[0][1]["event"] == "progress"
+    assert events[-1][1] == {
+        "event": "failed",
+        "code": "planning_stream_unavailable",
+        "message": "Live planning updates became unavailable. Please fetch the trip again.",
+    }
+    assert broken_reader.calls == 4
+    error_records = [
+        record
+        for record in caplog.records
+        if record.getMessage() == "Planning stream Redis read failed"
+    ]
+    assert len(error_records) == 3
+    assert all(record.error_type == "ConnectionError" for record in error_records)
+    assert "simulated connection loss" not in caplog.text
 
 
 @pytest.mark.asyncio

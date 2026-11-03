@@ -59,7 +59,12 @@ _TRIP_REQUIREMENTS_OUTPUT_SCHEMA: dict[str, Any] = {
         "destinations": {"type": "array", "items": {"type": "string"}},
         "start_date": {"anyOf": [{"type": "string"}, {"type": "null"}]},
         "end_date": {"anyOf": [{"type": "string"}, {"type": "null"}]},
-        "travelers": {"type": "integer", "minimum": 1, "maximum": 20},
+        "travelers": {
+            "anyOf": [
+                {"type": "integer", "minimum": 1, "maximum": 20},
+                {"type": "null"},
+            ]
+        },
         "budget": {
             "anyOf": [
                 {"type": "number", "minimum": 0},
@@ -68,6 +73,7 @@ _TRIP_REQUIREMENTS_OUTPUT_SCHEMA: dict[str, Any] = {
             ]
         },
         "return_deadline": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+        "return_to_origin": {"anyOf": [{"type": "boolean"}, {"type": "null"}]},
         "preferences": {"type": "array", "items": {"type": "string"}},
         "ambiguities": {"type": "array", "items": {"type": "string"}},
     },
@@ -79,12 +85,21 @@ _TRIP_REQUIREMENTS_OUTPUT_SCHEMA: dict[str, Any] = {
         "travelers",
         "budget",
         "return_deadline",
+        "return_to_origin",
         "preferences",
         "ambiguities",
     ],
 }
 
-ATTRACTION_EXTRACTION_MAX_TOKENS = 1200
+ATTRACTION_EXTRACTION_MAX_TOKENS = 4096
+ATTRACTION_EXTRACTION_RETRY_MAX_TOKENS = 8192
+MAX_ATTRACTION_EXTRACTION_CALLS = 3
+_REASONING_EFFORT_MODELS = frozenset(
+    {
+        "openai/gpt-oss-20b",
+        "openai/gpt-oss-120b",
+    }
+)
 
 
 def _attraction_output_schema(max_places: int) -> dict[str, Any]:
@@ -191,7 +206,10 @@ def _build_structured_client(
     *,
     model_name: str | None = None,
     force_json_object: bool = False,
-    max_tokens: int | None = None,
+    max_completion_tokens: int | None = None,
+    reasoning_effort: str | None = None,
+    include_reasoning: bool | None = None,
+    include_raw: bool = False,
 ) -> IntentCompletionClient:
     assert settings.groq_api_key is not None
     client_options: dict[str, Any] = {
@@ -201,21 +219,33 @@ def _build_structured_client(
         "timeout": settings.groq_timeout_seconds,
         "max_retries": 0,
     }
-    if max_tokens is not None:
-        client_options["max_tokens"] = max_tokens
+    model_kwargs: dict[str, Any] = {}
+    if max_completion_tokens is not None:
+        model_kwargs["max_completion_tokens"] = max_completion_tokens
+    if include_reasoning is not None:
+        model_kwargs["include_reasoning"] = include_reasoning
+    if model_kwargs:
+        client_options["model_kwargs"] = model_kwargs
+    if reasoning_effort is not None:
+        client_options["reasoning_effort"] = reasoning_effort
     chat_model = ChatGroq(**client_options)
     if force_json_object:
-        runnable = chat_model.with_structured_output(method="json_mode")
+        runnable = chat_model.with_structured_output(
+            method="json_mode",
+            include_raw=include_raw,
+        )
     elif (model_name or settings.groq_model) in _STRICT_JSON_SCHEMA_MODELS:
         runnable = chat_model.with_structured_output(
             output_schema,
             method="json_schema",
             strict=True,
+            include_raw=include_raw,
         )
     else:
         runnable = chat_model.with_structured_output(
             output_schema,
             method="json_mode",
+            include_raw=include_raw,
         )
     return cast(IntentCompletionClient, runnable)
 
@@ -224,7 +254,9 @@ def _build_plain_client(
     settings: Settings,
     *,
     model_name: str,
-    max_tokens: int,
+    max_completion_tokens: int,
+    reasoning_effort: str | None = None,
+    include_reasoning: bool | None = None,
 ) -> IntentCompletionClient:
     assert settings.groq_api_key is not None
     return cast(
@@ -235,7 +267,15 @@ def _build_plain_client(
             api_key=settings.groq_api_key,
             timeout=settings.groq_timeout_seconds,
             max_retries=0,
-            max_tokens=max_tokens,
+            reasoning_effort=reasoning_effort,
+            model_kwargs={
+                "max_completion_tokens": max_completion_tokens,
+                **(
+                    {"include_reasoning": include_reasoning}
+                    if include_reasoning is not None
+                    else {}
+                ),
+            },
         ),
     )
 
@@ -250,6 +290,21 @@ class _GroqErrorDetails:
     rate_limit_reset_requests: str | None
     rate_limit_reset_tokens: str | None
     failed_generation_length: int | None
+    finish_reason: str | None
+    completion_tokens: int | None
+    reasoning_tokens: int | None
+
+
+@dataclass(frozen=True, slots=True)
+class _CompletionTelemetry:
+    finish_reason: str | None
+    completion_tokens: int | None
+    reasoning_tokens: int | None
+    content_empty: bool | None
+
+
+class _AttractionCompletionLengthExhausted(Exception):
+    """A completion spent its output budget before producing extraction content."""
 
 
 def _safe_header_value(value: Any) -> str | None:
@@ -266,6 +321,25 @@ def _safe_error_identifier(value: Any) -> str | None:
     if cleaned is None or re.fullmatch(r"[A-Za-z0-9_.-]+", cleaned) is None:
         return None
     return cleaned
+
+
+def _safe_non_negative_int(value: Any) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
+
+
+def _usage_token_counts(usage: Any) -> tuple[int | None, int | None]:
+    if not isinstance(usage, Mapping):
+        return None, None
+    completion_tokens = _safe_non_negative_int(
+        usage.get("completion_tokens", usage.get("output_tokens"))
+    )
+    details = usage.get("completion_tokens_details", usage.get("output_tokens_details"))
+    reasoning_tokens = (
+        _safe_non_negative_int(details.get("reasoning_tokens"))
+        if isinstance(details, Mapping)
+        else None
+    )
+    return completion_tokens, reasoning_tokens
 
 
 def _exception_chain(exc: BaseException) -> list[BaseException]:
@@ -289,10 +363,19 @@ def _groq_error_details(exc: BaseException) -> _GroqErrorDetails:
             selected = candidate
             break
     body = _provider_error_body(selected)
+    response_body: Mapping[str, Any] = body if isinstance(body, Mapping) else {}
     error_body: Mapping[str, Any] = {}
     if isinstance(body, Mapping):
         nested = body.get("error")
         error_body = nested if isinstance(nested, Mapping) else body
+    choices = response_body.get("choices")
+    first_choice = choices[0] if isinstance(choices, list) and choices else {}
+    finish_reason = (
+        _safe_error_identifier(first_choice.get("finish_reason"))
+        if isinstance(first_choice, Mapping)
+        else None
+    )
+    completion_tokens, reasoning_tokens = _usage_token_counts(response_body.get("usage"))
     response = getattr(selected, "response", None)
     headers = getattr(response, "headers", {})
 
@@ -316,6 +399,9 @@ def _groq_error_details(exc: BaseException) -> _GroqErrorDetails:
             )
             else None
         ),
+        finish_reason=finish_reason,
+        completion_tokens=completion_tokens,
+        reasoning_tokens=reasoning_tokens,
     )
 
 
@@ -347,6 +433,55 @@ def _log_attraction_error(
             "http_status": details.http_status,
             "groq_error_code": details.provider_error_code,
             "failed_generation_length": details.failed_generation_length,
+            "finish_reason": details.finish_reason,
+            "completion_tokens": details.completion_tokens,
+            "reasoning_tokens": details.reasoning_tokens,
+        },
+    )
+
+
+def _completion_telemetry(result: Any) -> _CompletionTelemetry:
+    raw = result.get("raw") if isinstance(result, Mapping) and "raw" in result else result
+    if not isinstance(raw, BaseMessage):
+        return _CompletionTelemetry(None, None, None, None)
+
+    response_metadata = getattr(raw, "response_metadata", {})
+    finish_reason = (
+        _safe_error_identifier(response_metadata.get("finish_reason"))
+        if isinstance(response_metadata, Mapping)
+        else None
+    )
+    token_usage = (
+        response_metadata.get("token_usage")
+        if isinstance(response_metadata, Mapping)
+        else None
+    )
+    completion_tokens, reasoning_tokens = _usage_token_counts(token_usage)
+    usage_metadata = getattr(raw, "usage_metadata", None)
+    if isinstance(usage_metadata, Mapping):
+        if completion_tokens is None:
+            completion_tokens = _safe_non_negative_int(usage_metadata.get("output_tokens"))
+        output_details = usage_metadata.get("output_token_details")
+        if reasoning_tokens is None and isinstance(output_details, Mapping):
+            reasoning_tokens = _safe_non_negative_int(output_details.get("reasoning"))
+    content = raw.content
+    content_empty = not content.strip() if isinstance(content, str) else None
+    return _CompletionTelemetry(
+        finish_reason=finish_reason,
+        completion_tokens=completion_tokens,
+        reasoning_tokens=reasoning_tokens,
+        content_empty=content_empty,
+    )
+
+
+def _log_attraction_completion(telemetry: _CompletionTelemetry) -> None:
+    logger.info(
+        "Groq attraction extraction completion",
+        extra={
+            "finish_reason": telemetry.finish_reason,
+            "completion_tokens": telemetry.completion_tokens,
+            "reasoning_tokens": telemetry.reasoning_tokens,
+            "content_empty": telemetry.content_empty,
         },
     )
 
@@ -474,6 +609,7 @@ def _normalize_requirement_payload(
     for list_field in ("destinations", "preferences", "ambiguities"):
         if payload.get(list_field) is None:
             payload[list_field] = []
+    payload.setdefault("return_to_origin", None)
     destinations = payload.get("destinations")
     if isinstance(destinations, list):
         payload["destinations"] = [
@@ -499,6 +635,8 @@ def _normalize_requirement_payload(
         except ValueError:
             payload["start_date"] = None
             start_date = None
+            if isinstance(ambiguities, list):
+                ambiguities.append("Start date is invalid.")
 
     end_date = payload.get("end_date")
     if isinstance(end_date, str):
@@ -512,6 +650,8 @@ def _normalize_requirement_payload(
         except ValueError:
             payload["end_date"] = None
             end_date = None
+            if isinstance(ambiguities, list):
+                ambiguities.append("End date is invalid.")
 
     return_deadline = payload.get("return_deadline")
     parsed_deadline: datetime | None = None
@@ -691,6 +831,7 @@ class GroqAttractionExtractor:
         settings: Settings,
         *,
         client: IntentCompletionClient | None = None,
+        length_retry_client: IntentCompletionClient | None = None,
         json_client: IntentCompletionClient | None = None,
         plain_client: IntentCompletionClient | None = None,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
@@ -698,33 +839,56 @@ class GroqAttractionExtractor:
     ) -> None:
         self.settings = settings
         self._client = client
+        self._length_retry_client = length_retry_client
         self._json_client = json_client
         self._plain_client = plain_client
         self._sleep = sleep
         self._call_budget = call_budget
 
-    def _build_client(self) -> IntentCompletionClient:
+    def _reasoning_options(self, model_name: str) -> tuple[str | None, bool | None]:
+        if model_name not in _REASONING_EFFORT_MODELS:
+            return None, None
+        return (
+            self.settings.groq_extraction_reasoning_effort,
+            self.settings.groq_extraction_include_reasoning,
+        )
+
+    def _build_client(self, *, max_completion_tokens: int) -> IntentCompletionClient:
+        model_name = self.settings.groq_extraction_model_name
+        reasoning_effort, include_reasoning = self._reasoning_options(model_name)
         return _build_structured_client(
             self.settings,
             _attraction_output_schema(self.settings.attractions_per_destination),
-            model_name=self.settings.groq_extraction_model_name,
-            max_tokens=ATTRACTION_EXTRACTION_MAX_TOKENS,
+            model_name=model_name,
+            max_completion_tokens=max_completion_tokens,
+            reasoning_effort=reasoning_effort,
+            include_reasoning=include_reasoning,
+            include_raw=True,
         )
 
     def _build_json_client(self) -> IntentCompletionClient:
+        model_name = self.settings.groq_extraction_model_name
+        reasoning_effort, include_reasoning = self._reasoning_options(model_name)
         return _build_structured_client(
             self.settings,
             _attraction_output_schema(self.settings.attractions_per_destination),
-            model_name=self.settings.groq_extraction_model_name,
+            model_name=model_name,
             force_json_object=True,
-            max_tokens=ATTRACTION_EXTRACTION_MAX_TOKENS,
+            max_completion_tokens=self.settings.groq_extraction_max_completion_tokens,
+            reasoning_effort=reasoning_effort,
+            include_reasoning=include_reasoning,
+            include_raw=True,
         )
 
     def _build_plain_client(self) -> IntentCompletionClient:
+        model_name = self.settings.groq_extraction_fallback_model_name
+        reasoning_effort, include_reasoning = self._reasoning_options(model_name)
         return _build_plain_client(
             self.settings,
-            model_name=self.settings.groq_extraction_fallback_model_name,
-            max_tokens=ATTRACTION_EXTRACTION_MAX_TOKENS,
+            model_name=model_name,
+            max_completion_tokens=self.settings.groq_extraction_retry_max_completion_tokens,
+            reasoning_effort=reasoning_effort,
+            include_reasoning=include_reasoning,
         )
 
     async def extract_attractions(
@@ -770,6 +934,11 @@ class GroqAttractionExtractor:
             plain_text: bool = False,
         ) -> AttractionExtractionResult:
             nonlocal external_calls
+            if external_calls >= MAX_ATTRACTION_EXTRACTION_CALLS:
+                raise AttractionExtractionFailure(
+                    error_type="GroqExtractionCallLimit",
+                    external_calls=external_calls,
+                )
             if self._call_budget is not None and not await self._call_budget.consume("groq"):
                 raise AttractionExtractionFailure(
                     error_type="GroqDailyBudgetExhausted",
@@ -777,6 +946,10 @@ class GroqAttractionExtractor:
                 )
             external_calls += 1
             result = await model.ainvoke(messages)
+            telemetry = _completion_telemetry(result)
+            _log_attraction_completion(telemetry)
+            if telemetry.content_empty and telemetry.finish_reason == "length":
+                raise _AttractionCompletionLengthExhausted
             return _parse_attraction_extraction(
                 result,
                 external_calls=external_calls,
@@ -784,11 +957,38 @@ class GroqAttractionExtractor:
                 plain_text=plain_text,
             )
 
-        primary = self._client or self._build_client()
+        primary = self._client or self._build_client(
+            max_completion_tokens=self.settings.groq_extraction_max_completion_tokens
+        )
         try:
             return await invoke(primary)
         except AttractionExtractionFailure:
             raise
+        except _AttractionCompletionLengthExhausted:
+            retry_model = self._length_retry_client or self._build_client(
+                max_completion_tokens=(
+                    self.settings.groq_extraction_retry_max_completion_tokens
+                )
+            )
+            try:
+                return await invoke(retry_model)
+            except AttractionExtractionFailure:
+                raise
+            except _AttractionCompletionLengthExhausted:
+                pass
+            except Exception as retry_exc:
+                retry_details = _groq_error_details(retry_exc)
+                _log_attraction_error(retry_details)
+
+            plain_model = self._plain_client or self._build_plain_client()
+            try:
+                return await invoke(plain_model, plain_text=True)
+            except AttractionExtractionFailure:
+                raise
+            except Exception as plain_exc:
+                plain_details = _groq_error_details(plain_exc)
+                _log_attraction_error(plain_details)
+                raise _attraction_failure(plain_details, external_calls) from plain_exc
         except Exception as first_exc:
             first_details = _groq_error_details(first_exc)
             _log_attraction_error(first_details)
@@ -863,6 +1063,11 @@ def _parse_attraction_extraction(
     max_places: int,
     plain_text: bool,
 ) -> AttractionExtractionResult:
+    if isinstance(result, Mapping) and "raw" in result:
+        parsing_error = result.get("parsing_error")
+        if isinstance(parsing_error, BaseException):
+            raise parsing_error
+        result = result.get("parsed")
     payload = _first_balanced_json_object(_message_text(result)) if plain_text else result
     if isinstance(payload, BaseMessage):
         payload = payload.content

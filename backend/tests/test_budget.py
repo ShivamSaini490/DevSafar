@@ -183,7 +183,11 @@ def test_migration_0003_json_without_new_summary_fields_still_loads() -> None:
     response = TripResponse.model_validate(payload)
 
     assert response.feasible is True
+    assert response.assumptions == []
+    assert response.suggested_followups == []
+    assert response.mode_comparison == []
     assert response.route_legs[0].duration_source is None
     assert response.budget.known_subtotal == Decimal("10000.00")
     assert response.budget.unknown_categories == []
     assert BudgetBreakdown.model_validate(legacy_budget).total_estimated == Decimal("10000.00")
+    assert BudgetBreakdown.model_validate(legacy_budget).estimated_total_min is None

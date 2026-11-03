@@ -9,10 +9,15 @@ from typing import Any
 import httpx
 import pytest
 from conftest import FakeIntentModel
+from langchain_core.messages import AIMessage
 from pydantic import SecretStr
 
 from app.agents.graph import LangGraphTripPlanner
-from app.agents.llm import ATTRACTION_EXTRACTION_MAX_TOKENS, GroqAttractionExtractor
+from app.agents.llm import (
+    ATTRACTION_EXTRACTION_MAX_TOKENS,
+    AttractionExtractionFailure,
+    GroqAttractionExtractor,
+)
 from app.core.config import Settings
 from app.core.logging import bind_request_id, reset_request_id
 from app.db.session import create_redis_client
@@ -99,6 +104,25 @@ def _result_payload(*results: dict[str, Any]) -> dict[str, Any]:
 
 def _extraction(*items: dict[str, str]) -> dict[str, object]:
     return {"attractions": list(items)}
+
+
+def _empty_length_completion(
+    *,
+    completion_tokens: int = 4096,
+    reasoning_tokens: int = 4096,
+) -> AIMessage:
+    return AIMessage(
+        content="",
+        response_metadata={
+            "finish_reason": "length",
+            "token_usage": {
+                "completion_tokens": completion_tokens,
+                "completion_tokens_details": {
+                    "reasoning_tokens": reasoning_tokens,
+                },
+            },
+        },
+    )
 
 
 def _candidate(
@@ -736,6 +760,66 @@ class CountingGroqBudget:
 
 
 @pytest.mark.asyncio
+async def test_empty_length_completion_retries_once_with_larger_budget(
+    settings: Settings,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    sentence = "Rock Beach is a named attraction in Puducherry."
+    primary = FakeAttractionCompletionClient(_empty_length_completion())
+    larger_budget_retry = FakeAttractionCompletionClient(
+        _extraction(_candidate("Rock Beach", sentence, "beach"))
+    )
+    budget = CountingGroqBudget()
+
+    with caplog.at_level(logging.INFO):
+        result = await GroqAttractionExtractor(
+            _enabled_settings(settings),
+            client=primary,
+            length_retry_client=larger_budget_retry,
+            call_budget=budget,  # type: ignore[arg-type]
+        ).extract_attractions(city="Puducherry", snippets=[sentence])
+
+    assert [item.name for item in result.candidates] == ["Rock Beach"]
+    assert result.external_calls == 2
+    assert primary.calls == larger_budget_retry.calls == 1
+    assert budget.services == ["groq", "groq"]
+    completion_records = [
+        record
+        for record in caplog.records
+        if record.getMessage() == "Groq attraction extraction completion"
+    ]
+    assert len(completion_records) == 2
+    assert completion_records[0].finish_reason == "length"
+    assert completion_records[0].completion_tokens == 4096
+    assert completion_records[0].reasoning_tokens == 4096
+    assert completion_records[0].content_empty is True
+    assert sentence not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_length_retries_respect_three_call_cap_and_budget_count(
+    settings: Settings,
+) -> None:
+    primary = FakeAttractionCompletionClient(_empty_length_completion())
+    larger_budget_retry = FakeAttractionCompletionClient(_empty_length_completion())
+    plain = FakeAttractionCompletionClient(_empty_length_completion())
+    budget = CountingGroqBudget(allowed_calls=10)
+
+    with pytest.raises(AttractionExtractionFailure) as error:
+        await GroqAttractionExtractor(
+            _enabled_settings(settings),
+            client=primary,
+            length_retry_client=larger_budget_retry,
+            plain_client=plain,
+            call_budget=budget,  # type: ignore[arg-type]
+        ).extract_attractions(city="Puducherry", snippets=["Safe source sentence."])
+
+    assert error.value.external_calls == 3
+    assert primary.calls == larger_budget_retry.calls == plain.calls == 1
+    assert budget.services == ["groq", "groq", "groq"]
+
+
+@pytest.mark.asyncio
 async def test_double_json_validation_failure_uses_one_plain_text_json_fallback(
     settings: Settings,
     caplog: pytest.LogCaptureFixture,
@@ -1001,7 +1085,7 @@ async def test_configured_extraction_model_is_used(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     built_models: list[str] = []
-    built_max_tokens: list[int | None] = []
+    built_options: list[dict[str, Any]] = []
     sentence = "Rock Beach is a named attraction in Puducherry."
     completion = FakeAttractionCompletionClient(
         _extraction(_candidate("Rock Beach", sentence, "beach"))
@@ -1010,7 +1094,7 @@ async def test_configured_extraction_model_is_used(
     class FakeChatGroq:
         def __init__(self, **kwargs: Any) -> None:
             built_models.append(kwargs["model"])
-            built_max_tokens.append(kwargs.get("max_tokens"))
+            built_options.append(kwargs)
 
         def with_structured_output(self, *_args: Any, **_kwargs: Any) -> Any:
             return completion
@@ -1018,7 +1102,7 @@ async def test_configured_extraction_model_is_used(
     monkeypatch.setattr("app.agents.llm.ChatGroq", FakeChatGroq)
     enabled = _enabled_settings(settings).model_copy(
         update={
-            "groq_extraction_model": "primary-extraction-model",
+            "groq_extraction_model": "openai/gpt-oss-120b",
             "groq_extraction_fallback_model": "fallback-extraction-model",
             "groq_model": "base-model",
         }
@@ -1030,10 +1114,15 @@ async def test_configured_extraction_model_is_used(
     )
 
     assert [item.name for item in result.candidates] == ["Rock Beach"]
-    assert built_models == ["primary-extraction-model"]
-    assert built_max_tokens == [ATTRACTION_EXTRACTION_MAX_TOKENS]
+    assert built_models == ["openai/gpt-oss-120b"]
+    assert built_options[0]["model_kwargs"] == {
+        "max_completion_tokens": ATTRACTION_EXTRACTION_MAX_TOKENS,
+        "include_reasoning": False,
+    }
+    assert built_options[0]["reasoning_effort"] == "low"
+    assert "max_tokens" not in built_options[0]
     assert enabled.groq_extraction_model_chain == (
-        "primary-extraction-model",
+        "openai/gpt-oss-120b",
         "fallback-extraction-model",
         "base-model",
     )

@@ -14,6 +14,7 @@ from app.models.conversation import Conversation
 from app.models.itinerary import Itinerary
 from app.models.message import Message
 from app.models.trip import Trip
+from app.repositories.price_history_repository import PriceHistoryRepository
 from app.services.planning_service import PlanningStreamStore
 
 
@@ -24,6 +25,7 @@ class CleanupCounts:
     trips: int = 0
     itineraries: int = 0
     redis_streams: int = 0
+    price_history: int = 0
 
 
 async def _delete_trip_and_itinerary_dependencies(
@@ -148,3 +150,15 @@ class CleanupService:
             itineraries=itinerary_count,
             redis_streams=redis_stream_count,
         )
+
+    async def delete_expired_price_history(
+        self,
+        *,
+        retention_days: int,
+        now: datetime | None = None,
+    ) -> int:
+        async with self.db.begin():
+            return await PriceHistoryRepository(self.db).delete_expired(
+                now=now or utc_now(),
+                retention_days=retention_days,
+            )

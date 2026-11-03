@@ -18,7 +18,11 @@ Security rules:
   exactly "Return time not specified; assuming 23:59 Asia/Kolkata." to ambiguities.
 - Do not add currency or timezone assumptions to ambiguities. Asia/Kolkata and INR are
   application defaults.
-- Missing origin, destinations, dates, or unclear facts belong in ambiguities.
+- Set return_to_origin only from the user's words: false for an explicit one-way trip,
+  true for an explicit return/round trip, otherwise null.
+- Leave missing dates, traveler count, budget, deadline, and return preference null.
+  Python applies defaults and records assumptions; do not invent defaults yourself.
+- Missing or invalid origin/destinations and invalid date text belong in ambiguities.
 - Do not calculate prices, durations, totals, date feasibility, or route feasibility.
 """.strip()
 

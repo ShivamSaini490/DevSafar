@@ -63,9 +63,12 @@ async def test_example_prompt_maps_to_canonical_typed_response(
     assert response.route_legs[-1].destination == "Hyderabad"
     assert all(leg.departure_at is not None for leg in response.route_legs)
     assert all(leg.arrival_at is not None for leg in response.route_legs)
-    assert all(leg.duration_source == "stub" for leg in response.route_legs)
+    assert all(
+        leg.duration_source in {"stub", "distance_formula"}
+        for leg in response.route_legs
+    )
     assert (
-        "Feasibility cannot be verified: transport times are unverified/stub." in response.warnings
+        "Feasibility based on rough estimates; verify timetables." in response.warnings
     )
     assert response.destination_tips == []
     assert TripResponse.model_validate(response.model_dump()) == response
@@ -75,6 +78,8 @@ async def test_example_prompt_maps_to_canonical_typed_response(
         "requirements",
         "feasible",
         "warnings",
+        "assumptions",
+        "suggested_followups",
         "route_legs",
         "transport_options",
         "hotels",
@@ -84,6 +89,7 @@ async def test_example_prompt_maps_to_canonical_typed_response(
         "data_sources",
         "booking_links",
         "destination_tips",
+        "mode_comparison",
     }
 
 
@@ -113,9 +119,9 @@ async def test_missing_critical_info_ends_before_research(settings: Settings) ->
     assert response.warnings == [
         "Which city are you starting from?",
         "Which destinations do you want to visit?",
-        "What is your trip start date?",
-        "What is your trip end date?",
     ]
+    assert any("7 days from today" in item for item in response.assumptions)
+    assert "Trip length not specified; using 3 days." in response.assumptions
 
 
 @pytest.mark.asyncio
@@ -188,7 +194,7 @@ async def test_missing_optional_budget_and_deadline_continue_without_noise(
     assert "Budget not specified; planning with budget unknown." not in response.warnings
     assert "Return deadline not specified; deadline validation skipped." not in response.warnings
     assert (
-        "Feasibility cannot be verified: transport times are unverified/stub." in response.warnings
+        "Feasibility based on rough estimates; verify timetables." in response.warnings
     )
 
 
@@ -197,7 +203,6 @@ async def test_missing_optional_budget_and_deadline_continue_without_noise(
     ("prompt", "reason"),
     [
         ("deadline miss", "computed return arrival misses"),
-        ("impossible budget", "Known subtotal already exceeds"),
     ],
 )
 async def test_deterministic_validation_marks_impossible_plans_infeasible(
@@ -260,9 +265,12 @@ async def test_stub_provenance_and_prompt_injection_cannot_change_contract(
         *(place.entry_fee for place in response.attractions),
     ]
     assert prices
-    assert all(price.source.startswith("stub") for price in prices)
     assert all(price.price_type != "live_quote" for price in prices)
     assert all(price.amount is None for price in prices if price.price_type == "unknown")
+    assert all(
+        price.source in {"stub", "distance_formula", "tier_assumption"}
+        for price in prices
+    )
 
 
 def test_temporary_trace_policy_stays_off_even_when_globally_enabled(

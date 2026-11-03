@@ -27,6 +27,7 @@ from app.core.tracing import ChatMode, graph_tracing_context
 from app.integrations.base import ProviderBundle
 from app.rag.retriever import DestinationKnowledgeRetriever
 from app.schemas.trip import TripResponse
+from app.services.price_engine import PriceEngine
 from app.utils.datetime_utils import india_now
 
 ProgressStage = Literal["intent", "research", "planning", "validation", "response"]
@@ -95,6 +96,7 @@ class LangGraphTripPlanner:
         now_provider: Callable[[], datetime] = india_now,
         call_budget: ExternalCallBudget | None = None,
         rag_retriever: DestinationKnowledgeRetriever | None = None,
+        price_engine: PriceEngine | None = None,
     ) -> None:
         self.settings = settings
         workflow = StateGraph(TravelState)
@@ -123,7 +125,11 @@ class LangGraphTripPlanner:
             "planning",
             _progress_node(
                 "planning",
-                build_planning_node(settings, now_provider=now_provider),
+                build_planning_node(
+                    settings,
+                    now_provider=now_provider,
+                    price_engine=price_engine,
+                ),
             ),
         )
         workflow.add_node("validation", _progress_node("validation", validation_node))
@@ -156,6 +162,7 @@ class LangGraphTripPlanner:
         fetched_at = utc_now()
         initial: TravelState = {
             "trip_id": trip_id or uuid4(),
+            "chat_mode": chat_mode,
             "conversation_id": conversation_id,
             "user_prompt": user_prompt,
             "requirements": None,
@@ -171,6 +178,9 @@ class LangGraphTripPlanner:
             "validation_errors": [],
             "feasible": None,
             "warnings": [],
+            "assumptions": [],
+            "suggested_followups": [],
+            "mode_comparison": [],
             "retry_count": 0,
             "status": "completed",
             "provider_sources": [],

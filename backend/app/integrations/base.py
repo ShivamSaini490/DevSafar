@@ -1,14 +1,163 @@
+import asyncio
+import random
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
-from typing import Literal, Protocol
+from email.utils import parsedate_to_datetime
+from typing import Any, Literal, Protocol, TypeVar
 
+import httpx
+from pydantic import BaseModel, ValidationError
+
+from app.core.logging import redact_exception_message
 from app.schemas.attraction import AttractionOption
 from app.schemas.common import DataSource, PriceQuote, PriceType
 from app.schemas.hotel import HotelOption
 from app.schemas.transport import RouteLeg, TransportOption
 from app.schemas.trip import TripRequirements
 from app.services.route_service import ordered_route_stops
+
+ResponseModel = TypeVar("ResponseModel", bound=BaseModel)
+ProviderFailureCode = Literal[
+    "auth_failed",
+    "circuit_open",
+    "quota",
+    "timeout",
+    "server_error",
+    "request_error",
+    "schema_mismatch",
+]
+
+
+class ProviderFailure(Exception):
+    def __init__(self, code: ProviderFailureCode, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+
+
+class ProviderCircuitBreaker:
+    def __init__(self) -> None:
+        self._auth_failed_until: dict[str, datetime] = {}
+
+    def is_open(self, provider: str, *, now: datetime) -> bool:
+        until = self._auth_failed_until.get(provider)
+        return until is not None and until > now
+
+    def open_auth_failure(
+        self,
+        provider: str,
+        *,
+        now: datetime,
+        minutes: int,
+    ) -> None:
+        self._auth_failed_until[provider] = now + timedelta(minutes=minutes)
+
+
+class SafeProviderHttpClient:
+    """Bounded provider HTTP calls with public-safe failures and no secret URLs."""
+
+    def __init__(
+        self,
+        client: httpx.AsyncClient,
+        *,
+        timeout_seconds: float,
+        max_retries: int,
+        max_retry_wait_seconds: float,
+        auth_circuit_minutes: int,
+        circuit_breaker: ProviderCircuitBreaker | None = None,
+        sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        now_provider: Callable[[], datetime] = lambda: datetime.now(UTC),
+        jitter: Callable[[], float] = random.random,
+    ) -> None:
+        self.client = client
+        self.timeout_seconds = timeout_seconds
+        self.max_retries = max_retries
+        self.max_retry_wait_seconds = max_retry_wait_seconds
+        self.auth_circuit_minutes = auth_circuit_minutes
+        self.circuit_breaker = circuit_breaker or ProviderCircuitBreaker()
+        self.sleep = sleep
+        self.now_provider = now_provider
+        self.jitter = jitter
+
+    async def get_json(
+        self,
+        *,
+        provider: str,
+        url: str,
+        params: dict[str, str | int],
+        response_model: type[ResponseModel],
+        secret_values: tuple[str, ...] = (),
+    ) -> ResponseModel:
+        if self.circuit_breaker.is_open(provider, now=self.now_provider()):
+            raise ProviderFailure("circuit_open", f"{provider} auth circuit is open")
+        for attempt in range(self.max_retries + 1):
+            try:
+                response = await self.client.get(
+                    url,
+                    params=params,
+                    timeout=self.timeout_seconds,
+                )
+            except httpx.TimeoutException:
+                if attempt < self.max_retries:
+                    await self._backoff(attempt)
+                    continue
+                raise ProviderFailure("timeout", f"{provider} request timed out") from None
+            except httpx.RequestError as exc:
+                safe = redact_exception_message(exc, secret_values=secret_values)
+                del safe  # The exception text is intentionally not exposed or re-raised.
+                raise ProviderFailure("request_error", f"{provider} request failed") from None
+
+            if response.status_code in {401, 403}:
+                self.circuit_breaker.open_auth_failure(
+                    provider,
+                    now=self.now_provider(),
+                    minutes=self.auth_circuit_minutes,
+                )
+                raise ProviderFailure("auth_failed", f"{provider} authentication failed")
+            if response.status_code == 429:
+                wait_seconds = _retry_after_seconds(
+                    response.headers.get("Retry-After"),
+                    now=self.now_provider(),
+                )
+                if wait_seconds is not None:
+                    await self.sleep(min(wait_seconds, self.max_retry_wait_seconds))
+                raise ProviderFailure("quota", f"{provider} quota or throughput limit reached")
+            if response.status_code >= 500:
+                if attempt < self.max_retries:
+                    await self._backoff(attempt)
+                    continue
+                raise ProviderFailure("server_error", f"{provider} server error")
+            if response.status_code >= 400:
+                raise ProviderFailure("request_error", f"{provider} rejected the request")
+            try:
+                payload: Any = response.json()
+                return response_model.model_validate(payload)
+            except (ValueError, ValidationError, TypeError):
+                raise ProviderFailure(
+                    "schema_mismatch",
+                    f"{provider} returned an invalid response",
+                ) from None
+        raise AssertionError("provider retry loop must return or raise")
+
+    async def _backoff(self, attempt: int) -> None:
+        base = min(self.max_retry_wait_seconds, 0.25 * (2**attempt))
+        await self.sleep(min(self.max_retry_wait_seconds, base + self.jitter() * 0.1))
+
+
+def _retry_after_seconds(value: str | None, *, now: datetime) -> float | None:
+    if not value:
+        return None
+    try:
+        return max(0.0, float(value))
+    except ValueError:
+        try:
+            parsed = parsedate_to_datetime(value)
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=UTC)
+            return max(0.0, (parsed - now).total_seconds())
+        except (TypeError, ValueError, OverflowError):
+            return None
 
 
 class MapsProvider(Protocol):
@@ -48,6 +197,10 @@ class StubMapsProvider:
                     price_type="unknown",
                     source="stub",
                     fetched_at=self.fetched_at,
+                    status="unavailable",
+                    provider="stub",
+                    observed_at=self.fetched_at,
+                    price_unit="one route leg",
                 ),
             )
             for origin, destination in zip(stops, stops[1:], strict=False)
@@ -74,6 +227,10 @@ class StubTransportProvider:
                     price_type="estimate",
                     source="stub",
                     fetched_at=self.fetched_at,
+                    status="formula_estimate",
+                    provider="stub",
+                    observed_at=self.fetched_at,
+                    price_unit="one traveller one-way",
                 ),
                 availability="unknown",
             )
@@ -115,12 +272,20 @@ class StubHotelProvider:
                     price_type="estimate",
                     source="stub",
                     fetched_at=self.fetched_at,
+                    status="formula_estimate",
+                    provider="stub",
+                    observed_at=self.fetched_at,
+                    price_unit="one room per night",
                 ),
                 total_price=PriceQuote(
                     amount=nightly * per_destination,
                     price_type="estimate",
                     source="stub",
                     fetched_at=self.fetched_at,
+                    status="formula_estimate",
+                    provider="stub",
+                    observed_at=self.fetched_at,
+                    price_unit="one room, full stay",
                 ),
                 availability="unknown",
             )
@@ -143,6 +308,10 @@ class StubPlacesProvider:
                     price_type="unknown",
                     source="stub",
                     fetched_at=self.fetched_at,
+                    status="unavailable",
+                    provider="stub",
+                    observed_at=self.fetched_at,
+                    price_unit="one adult entry",
                 ),
                 opening_hours=None,
                 source_url=None,

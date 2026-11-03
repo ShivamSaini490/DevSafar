@@ -30,6 +30,9 @@ KEY_VALUE_PATTERN = re.compile(
     r"(?i)(\b(?:api[_-]?key|authorization|cookie|email|jwt|otp|passwd|password|secret|token)"
     r"\b\s*[=:]\s*)([^\s,;]+)"
 )
+URL_SECRET_QUERY_PATTERN = re.compile(
+    r"(?i)([?&](?:api[_-]?key|key|token)=)[^&#\s]+"
+)
 
 STANDARD_RECORD_FIELDS = frozenset(logging.makeLogRecord({}).__dict__)
 _REQUEST_ID: ContextVar[str] = ContextVar("request_id", default="unavailable")
@@ -53,11 +56,21 @@ def _is_sensitive_key(key: object) -> bool:
 
 
 def redact_sensitive_text(value: str) -> str:
-    redacted = EMAIL_PATTERN.sub("[REDACTED_EMAIL]", value)
+    redacted = URL_SECRET_QUERY_PATTERN.sub(r"\1[REDACTED]", value)
+    redacted = EMAIL_PATTERN.sub("[REDACTED_EMAIL]", redacted)
     redacted = CONNECTION_URL_PATTERN.sub("[REDACTED_CONNECTION_URL]", redacted)
     redacted = AUTHORIZATION_PATTERN.sub(r"\1[REDACTED]", redacted)
     redacted = BEARER_PATTERN.sub("Bearer [REDACTED]", redacted)
     return KEY_VALUE_PATTERN.sub(r"\1[REDACTED]", redacted)
+
+
+class SensitiveLogFilter(logging.Filter):
+    """Redact before propagation so caplog and third-party handlers stay safe."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        record.msg = redact_sensitive_text(record.getMessage())
+        record.args = ()
+        return True
 
 
 def redact_sensitive_data(value: Any, *, key: object | None = None) -> Any:
@@ -130,3 +143,8 @@ def configure_logging(level: str) -> None:
         handler.setFormatter(formatter)
         root_logger.addHandler(handler)
     root_logger.setLevel(level)
+    for logger_name in ("httpx", "httpcore"):
+        third_party_logger = logging.getLogger(logger_name)
+        third_party_logger.setLevel(logging.WARNING)
+        if not any(isinstance(item, SensitiveLogFilter) for item in third_party_logger.filters):
+            third_party_logger.addFilter(SensitiveLogFilter())

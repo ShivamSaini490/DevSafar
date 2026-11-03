@@ -1,3 +1,4 @@
+import asyncio
 import hashlib
 import hmac
 import json
@@ -5,11 +6,14 @@ import logging
 import re
 import time
 from collections.abc import AsyncIterator
+from contextlib import suppress
 from datetime import UTC, datetime
 from typing import cast
 from uuid import UUID
 
 from redis.asyncio import Redis
+from redis.exceptions import ConnectionError as RedisConnectionError
+from redis.exceptions import TimeoutError as RedisTimeoutError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.agents.graph import (
@@ -20,9 +24,10 @@ from app.agents.graph import (
 )
 from app.core.config import Settings
 from app.core.exceptions import AppError
-from app.core.logging import bind_request_id, reset_request_id
+from app.core.logging import bind_request_id, current_request_id, reset_request_id
 from app.core.rate_limiter import PlanningLease
 from app.core.tracing import temporary_chat_tracing_enabled
+from app.db.session import create_planning_stream_redis_client
 from app.schemas.trip import TripResponse
 from app.services.chat_service import ChatService
 from app.services.temporary_chat_service import (
@@ -39,7 +44,10 @@ FAILED_INTENT_BUDGET_MESSAGE = (
 FAILED_UNAVAILABLE_MESSAGE = "Trip planning failed safely. Please try again."
 FAILED_EXPIRED_MESSAGE = "Planning result is no longer available."
 FAILED_INTERRUPTED_MESSAGE = "Planning stopped before completion. Please start a new run."
+FAILED_STREAM_MESSAGE = "Live planning updates became unavailable. Please fetch the trip again."
 _STREAM_ID_PATTERN = re.compile(r"^\d+-\d+$")
+_STREAM_CONNECTION_RETRIES = 3
+_STREAM_CONNECTION_RETRY_BASE_SECONDS = 0.1
 
 TERMINAL_EVENT_SCRIPT = """
 local existing = redis.call('HGET', KEYS[2], 'terminal_id')
@@ -55,9 +63,16 @@ return event_id
 
 
 class PlanningStreamStore:
-    def __init__(self, redis: Redis, settings: Settings) -> None:
+    def __init__(
+        self,
+        redis: Redis,
+        settings: Settings,
+        *,
+        blocking_redis: Redis | None = None,
+    ) -> None:
         self.redis = redis
         self.settings = settings
+        self._blocking_redis = blocking_redis
 
     async def create_saved(
         self,
@@ -177,32 +192,74 @@ class PlanningStreamStore:
         *,
         last_event_id: str | None,
     ) -> AsyncIterator[str]:
-        metadata = await self.metadata(trip_id)
-        if metadata is None:
-            return
-        cursor = (
-            last_event_id
-            if last_event_id and _STREAM_ID_PATTERN.fullmatch(last_event_id)
-            else "0-0"
+        block_seconds = max(
+            0.1,
+            float(self.settings.planning_stream_heartbeat_seconds) / 2,
         )
-        terminal_id = metadata.get("terminal_id")
-        if terminal_id is not None and cursor == terminal_id:
-            return
-        created_at = datetime.fromisoformat(metadata["created_at"])
-        expires_at = created_at.timestamp() + self.settings.planning_stream_max_seconds
-        stream_key = self.stream_key(trip_id)
-        while True:
-            remaining = expires_at - time.time()
-            if remaining <= 0:
-                await self.publish_failed(
-                    trip_id,
-                    code="planning_interrupted",
-                    message=FAILED_INTERRUPTED_MESSAGE,
-                )
-                rows = cast(
-                    list[tuple[str, list[tuple[str, dict[str, str]]]]],
-                    await self.redis.xread({stream_key: cursor}, count=100),
-                )
+        blocking_redis = self._blocking_redis or create_planning_stream_redis_client(
+            self.settings,
+            block_seconds=block_seconds,
+        )
+        owns_blocking_redis = self._blocking_redis is None
+        try:
+            metadata = await self.metadata(trip_id)
+            if metadata is None:
+                return
+            cursor = (
+                last_event_id
+                if last_event_id and _STREAM_ID_PATTERN.fullmatch(last_event_id)
+                else "0-0"
+            )
+            terminal_id = metadata.get("terminal_id")
+            if terminal_id is not None and cursor == terminal_id:
+                return
+            created_at = datetime.fromisoformat(metadata["created_at"])
+            expires_at = created_at.timestamp() + self.settings.planning_stream_max_seconds
+            stream_key = self.stream_key(trip_id)
+            connection_failures = 0
+            while True:
+                remaining = expires_at - time.time()
+                if remaining <= 0:
+                    await self.publish_failed(
+                        trip_id,
+                        code="planning_interrupted",
+                        message=FAILED_INTERRUPTED_MESSAGE,
+                    )
+                    rows = cast(
+                        list[tuple[str, list[tuple[str, dict[str, str]]]]],
+                        await blocking_redis.xread({stream_key: cursor}, count=100),
+                    )
+                else:
+                    current_block_seconds = min(block_seconds, remaining)
+                    try:
+                        rows = cast(
+                            list[tuple[str, list[tuple[str, dict[str, str]]]]],
+                            await blocking_redis.xread(
+                                {stream_key: cursor},
+                                count=100,
+                                block=max(1, int(current_block_seconds * 1000)),
+                            ),
+                        )
+                        connection_failures = 0
+                    except RedisTimeoutError as exc:
+                        self._log_stream_redis_failure(exc, level=logging.DEBUG)
+                        yield ": heartbeat\n\n"
+                        continue
+                    except RedisConnectionError as exc:
+                        connection_failures += 1
+                        self._log_stream_redis_failure(exc, level=logging.WARNING)
+                        if connection_failures >= _STREAM_CONNECTION_RETRIES:
+                            yield self._stream_failure_event()
+                            return
+                        await asyncio.sleep(
+                            _STREAM_CONNECTION_RETRY_BASE_SECONDS * connection_failures
+                        )
+                        continue
+                if not rows:
+                    if remaining <= 0:
+                        return
+                    yield ": heartbeat\n\n"
+                    continue
                 for _key, entries in rows:
                     for event_id, fields in entries:
                         cursor = event_id
@@ -211,30 +268,40 @@ class PlanningStreamStore:
                         event = json.loads(payload)
                         if event.get("event") in {"completed", "failed"}:
                             return
-                return
-            block_seconds = min(
-                float(self.settings.planning_stream_heartbeat_seconds),
-                remaining,
-            )
-            rows = cast(
-                list[tuple[str, list[tuple[str, dict[str, str]]]]],
-                await self.redis.xread(
-                    {stream_key: cursor},
-                    count=100,
-                    block=max(1, int(block_seconds * 1000)),
-                ),
-            )
-            if not rows:
-                yield ": heartbeat\n\n"
-                continue
-            for _key, entries in rows:
-                for event_id, fields in entries:
-                    cursor = event_id
-                    payload = fields["payload"]
-                    yield f"id: {cursor}\ndata: {payload}\n\n"
-                    event = json.loads(payload)
-                    if event.get("event") in {"completed", "failed"}:
-                        return
+                if remaining <= 0:
+                    return
+        except asyncio.CancelledError:
+            return
+        except Exception as exc:
+            self._log_stream_redis_failure(exc, level=logging.WARNING)
+            yield self._stream_failure_event()
+        finally:
+            if owns_blocking_redis:
+                with suppress(Exception):
+                    await blocking_redis.aclose()
+
+    @staticmethod
+    def _stream_failure_event() -> str:
+        payload = json.dumps(
+            {
+                "event": "failed",
+                "code": "planning_stream_unavailable",
+                "message": FAILED_STREAM_MESSAGE,
+            },
+            separators=(",", ":"),
+        )
+        return f"data: {payload}\n\n"
+
+    @staticmethod
+    def _log_stream_redis_failure(exc: BaseException, *, level: int) -> None:
+        logger.log(
+            level,
+            "Planning stream Redis read failed",
+            extra={
+                "request_id": current_request_id(),
+                "error_type": type(exc).__name__,
+            },
+        )
 
     def temporary_binding(self, temp_session_id: str, temp_token: str) -> str:
         return hmac.new(

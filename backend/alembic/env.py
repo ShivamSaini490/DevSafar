@@ -13,6 +13,7 @@ from app.models import (
     Itinerary,
     Message,
     PasswordResetOtp,
+    PriceHistory,
     Trip,
     User,
 )
@@ -23,7 +24,16 @@ if config.config_file_name is not None:
 
 config.set_main_option("sqlalchemy.url", get_settings().database_url.replace("%", "%%"))
 target_metadata = Base.metadata
-_models = (AuthSession, Conversation, Itinerary, Message, PasswordResetOtp, Trip, User)
+_models = (
+    AuthSession,
+    Conversation,
+    Itinerary,
+    Message,
+    PasswordResetOtp,
+    PriceHistory,
+    Trip,
+    User,
+)
 
 
 def run_migrations_offline() -> None:

@@ -15,6 +15,15 @@ def test_tavily_defaults_are_disabled_and_bounded() -> None:
     assert settings.tavily_snippets_for_extraction == 4
     assert settings.attraction_snippet_max_chars == 700
     assert settings.attractions_per_destination == 6
+    assert settings.serpapi_enabled is False
+    assert settings.serpapi_monthly_budget == 250
+    assert settings.serpapi_max_searches_per_trip == 3
+    assert settings.price_history_enabled is True
+    assert settings.price_history_max_age_days == 90
+    assert settings.price_history_retention_days == 180
+    assert settings.allow_demo_price_data is False
+    assert settings.flight_cache_ttl_seconds == 900
+    assert settings.hotel_cache_ttl_seconds == 1800
     assert settings.groq_max_retry_wait_seconds == 8
     assert settings.groq_extraction_model_name == settings.groq_model
     assert settings.tavily_excluded_domain_set == {

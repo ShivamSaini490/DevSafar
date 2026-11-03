@@ -2,17 +2,25 @@ from datetime import datetime
 from typing import TypedDict
 from uuid import UUID
 
+from app.core.tracing import ChatMode
 from app.schemas.attraction import AttractionOption
 from app.schemas.budget import BudgetBreakdown
 from app.schemas.common import DataSource
 from app.schemas.hotel import HotelOption
 from app.schemas.itinerary import ItineraryDay
 from app.schemas.transport import RouteLeg, TransportOption
-from app.schemas.trip import DestinationTip, TripRequirements, TripResponse, TripStatus
+from app.schemas.trip import (
+    DestinationTip,
+    ModeComparison,
+    TripRequirements,
+    TripResponse,
+    TripStatus,
+)
 
 
 class TravelState(TypedDict):
     trip_id: UUID
+    chat_mode: ChatMode
     conversation_id: UUID | None
     user_prompt: str
     requirements: TripRequirements | None
@@ -28,6 +36,9 @@ class TravelState(TypedDict):
     validation_errors: list[str]
     feasible: bool | None
     warnings: list[str]
+    assumptions: list[str]
+    suggested_followups: list[str]
+    mode_comparison: list[ModeComparison]
     retry_count: int
     status: TripStatus
     provider_sources: list[DataSource]

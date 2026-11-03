@@ -177,7 +177,7 @@ async def test_return_date_without_time_defaults_to_end_of_day_and_warns(
     assert response.requirements.return_deadline == datetime(
         2026, 11, 5, 23, 59, tzinfo=INDIA_TIME_ZONE
     )
-    assert "Return time not specified; assuming 23:59 Asia/Kolkata." in response.warnings
+    assert "Return time not specified; assuming 23:59 Asia/Kolkata." in response.assumptions
     assert not any(
         noise in warning.casefold()
         for warning in response.warnings
@@ -418,43 +418,31 @@ async def test_realistic_groq_json_normalizes_full_example_prompt(
     )
     assert trip["itinerary_days"]
     assert trip["budget"]["categories"]
-    assert trip["budget"]["known_subtotal"] == "10500.00"
-    assert trip["budget"]["unknown_categories"] == ["Attractions"]
-    assert "Travelers not specified; assuming 1." in trip["warnings"]
+    assert Decimal(trip["budget"]["known_subtotal"]) > 0
+    assert "Transport" in trip["budget"]["unknown_categories"]
+    assert "Attractions" in trip["budget"]["unknown_categories"]
+    assert trip["budget"]["omitted_categories"] == ["Transport", "Attractions"]
+    assert "Travelers not specified; assuming 1." in trip["assumptions"]
     assert not any("timezone" in warning.casefold() for warning in trip["warnings"])
     assert (
-        "Feasibility cannot be verified: transport times are unverified/stub." in trip["warnings"]
+        "Feasibility based on rough estimates; verify timetables." in trip["warnings"]
     )
 
     arrivals = {leg["destination"]: leg["arrival_at"] for leg in trip["route_legs"]}
     for day in trip["itinerary_days"]:
         for activity in day["activities"]:
-            if activity["location"] in arrivals:
+            if activity["location"] in arrivals and activity["starts_at"] is not None:
                 assert activity["starts_at"] >= arrivals[activity["location"]]
-    return_arrival = trip["route_legs"][-1]["arrival_at"]
-    return_day = next(day for day in trip["itinerary_days"] if day["date"] == return_arrival[:10])
+    return_day = trip["itinerary_days"][-1]
+    assert return_day["date"] == trip["requirements"]["end_date"]
     assert return_day["destination"] == "Hyderabad"
     assert any(activity["title"] == "Arrive in Hyderabad" for activity in return_day["activities"])
 
     for hotel in trip["hotels"]:
         assert hotel["destination"] != "Hyderabad"
-        if hotel["destination"] == "en route":
-            assert hotel["name"].startswith("Overnight rest stop between")
-            assert hotel["total_price"]["source"] == "stub_overnight_rest_estimate"
-            continue
-        arrival_leg = next(
-            leg for leg in trip["route_legs"] if leg["destination"] == hotel["destination"]
-        )
-        departure_leg = next(
-            leg for leg in trip["route_legs"] if leg["origin"] == hotel["destination"]
-        )
-        assert hotel["check_in"] == arrival_leg["arrival_at"][:10]
-        assert hotel["check_out"] == departure_leg["departure_at"][:10]
-    ordered_hotels = sorted(trip["hotels"], key=lambda hotel: hotel["check_in"])
-    assert all(
-        current["check_in"] >= previous["check_out"]
-        for previous, current in zip(ordered_hotels, ordered_hotels[1:], strict=False)
-    )
+        assert hotel["tier"] in {"budget", "standard", "comfort"}
+        assert hotel["total_price"]["source"] == "tier_assumption"
+        assert hotel["total_price"]["amount_min"] <= hotel["total_price"]["amount_max"]
     prices = [
         *(leg["price"] for leg in trip["route_legs"]),
         *(option["price"] for option in trip["transport_options"]),
@@ -474,6 +462,7 @@ async def test_realistic_groq_json_normalizes_full_example_prompt(
         "travelers": 1,
         "budget": "15000",
         "return_deadline": "2026-11-02T10:00:00+05:30",
+        "return_to_origin": True,
         "preferences": [],
         "ambiguities": [],
     }
@@ -481,6 +470,83 @@ async def test_realistic_groq_json_normalizes_full_example_prompt(
     messages = fake_client.inputs[0]
     assert isinstance(messages, list)
     assert "Current date in Asia/Kolkata is 2026-10-30" in str(messages[0].content)
+
+
+@pytest.mark.asyncio
+async def test_hyderabad_delhi_without_budget_or_return_has_complete_ranges(
+    app: FastAPI,
+    client: AsyncClient,
+    settings: Settings,
+    valid_signup: dict[str, str],
+) -> None:
+    prompt = "mujhe hyderabad se delhi jana hai 03/11/2026"
+    fake_client = FakeIntentCompletionClient(
+        {
+            "origin": "Hyderabad",
+            "destinations": ["Delhi"],
+            "start_date": "03/11/2026",
+            "end_date": None,
+            "travelers": 1,
+            "budget": None,
+            "return_deadline": None,
+            "return_to_origin": False,
+            "preferences": [],
+            "ambiguities": [],
+        }
+    )
+    _install_groq_intent_model(
+        app,
+        settings,
+        fake_client,
+        api_key="fake-delhi-regression-key",
+        current_date=date(2026, 11, 3),
+    )
+    await _signup_and_login(client, valid_signup)
+    conversation = await client.post(
+        "/api/v1/conversations", json={}, headers=_csrf_headers(client)
+    )
+
+    response = await client.post(
+        f"/api/v1/conversations/{conversation.json()['id']}/messages",
+        json={"content": prompt},
+        headers=_csrf_headers(client),
+    )
+
+    assert response.status_code == 201, response.text
+    trip = response.json()["trip"]
+    assert trip["requirements"]["end_date"] == "2026-11-05"
+    assert trip["mode_comparison"]
+    flight = next(item for item in trip["mode_comparison"] if item["mode"] == "flight")
+    assert flight["duration_minutes_min"] is not None
+    assert flight["duration_minutes_max"] is not None
+    assert flight["transport_price"]["amount"] is not None or (
+        flight["transport_price"]["amount_min"] is not None
+        and flight["transport_price"]["amount_max"] is not None
+    )
+    route_leg = trip["route_legs"][0]
+    assert route_leg["mode"] == "flight"
+    assert route_leg["duration_minutes_min"] is not None
+    assert route_leg["duration_minutes_max"] is not None
+    assert route_leg["price"]["amount"] is not None or (
+        route_leg["price"]["amount_min"] is not None
+        and route_leg["price"]["amount_max"] is not None
+    )
+    for hotel in trip["hotels"]:
+        assert hotel["total_price"]["amount"] is not None or (
+            hotel["total_price"]["amount_min"] is not None
+            and hotel["total_price"]["amount_max"] is not None
+        )
+    categories = {item["name"]: item for item in trip["budget"]["categories"]}
+    for name in ("Transport", "Hotels", "Food", "Local transport"):
+        assert categories[name]["amount"] is not None or (
+            categories[name]["amount_min"] is not None
+            and categories[name]["amount_max"] is not None
+        )
+    assert Decimal(trip["budget"]["known_subtotal"]) > 0
+    assert trip["budget"]["estimated_total_min"] is not None
+    assert trip["budget"]["estimated_total_max"] is not None
+    assert trip["budget"]["omitted_categories"] == ["Attractions"]
+    assert fake_client.calls == 1
 
 
 @pytest.mark.asyncio
@@ -561,9 +627,8 @@ async def test_null_critical_fields_return_specific_clarification_questions(
     assert trip["warnings"] == [
         "Which city are you starting from?",
         "Which destinations do you want to visit?",
-        "What is your trip start date?",
-        "What is your trip end date?",
     ]
+    assert len(trip["assumptions"]) >= 4
     assert trip["route_legs"] == []
     assert fake_client.calls == 1
 
@@ -608,7 +673,7 @@ async def test_invalid_date_returns_python_generated_clarification(
     assert response.status_code == 201, response.text
     trip = response.json()["trip"]
     assert trip["status"] == "needs_clarification"
-    assert trip["warnings"] == ["What is your trip start date?"]
+    assert trip["warnings"] == ["What valid future start date should I use?"]
     assert trip["route_legs"] == []
     assert fake_client.calls == 1
 

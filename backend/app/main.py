@@ -20,12 +20,15 @@ from app.core.exceptions import handle_unexpected_exception, register_exception_
 from app.core.logging import bind_request_id, configure_logging, reset_request_id
 from app.core.rate_limiter import RedisExternalCallBudget
 from app.db.session import create_db_engine, create_redis_client, create_session_factory
-from app.integrations.base import ProviderBundle
+from app.integrations.base import ProviderBundle, SafeProviderHttpClient
 from app.integrations.maps_provider import OsmMapsProvider
+from app.integrations.serpapi_flights import SerpApiFlightsProvider
+from app.integrations.serpapi_hotels import SerpApiHotelsProvider
 from app.integrations.tavily_provider import TavilyAttractionsProvider
 from app.rag.embeddings import FastEmbedService
 from app.rag.retriever import RAGRetriever
 from app.rag.vector_store import QdrantVectorStore
+from app.services.price_engine import PriceEngine
 from app.tasks.cleanup_tasks import run_cleanup_loop
 
 logger = logging.getLogger(__name__)
@@ -147,8 +150,37 @@ def _lifespan(settings: Settings) -> Callable[[FastAPI], AbstractAsyncContextMan
                     cache_ttl_seconds=settings.rag_cache_ttl_seconds,
                 )
                 app.state.rag_store = rag_store
-            if settings.maps_provider == "osm" or settings.tavily_configured:
+            if (
+                settings.maps_provider == "osm"
+                or settings.tavily_configured
+                or settings.serpapi_configured
+            ):
                 provider_http_client = httpx.AsyncClient()
+            safe_provider_http: SafeProviderHttpClient | None = None
+            if settings.serpapi_configured:
+                assert provider_http_client is not None
+                safe_provider_http = SafeProviderHttpClient(
+                    provider_http_client,
+                    timeout_seconds=settings.serpapi_timeout_seconds,
+                    max_retries=settings.serpapi_max_retries,
+                    max_retry_wait_seconds=settings.serpapi_max_retry_wait_seconds,
+                    auth_circuit_minutes=settings.serpapi_auth_circuit_minutes,
+                )
+            price_engine = PriceEngine(
+                settings,
+                redis,
+                session_factory,
+                flights=(
+                    SerpApiFlightsProvider(settings, safe_provider_http)
+                    if safe_provider_http is not None
+                    else None
+                ),
+                hotels=(
+                    SerpApiHotelsProvider(settings, safe_provider_http)
+                    if safe_provider_http is not None
+                    else None
+                ),
+            )
             if settings.tavily_configured:
                 attraction_extractor = GroqAttractionExtractor(
                     settings,
@@ -188,6 +220,7 @@ def _lifespan(settings: Settings) -> Callable[[FastAPI], AbstractAsyncContextMan
                     provider_factory=provider_factory,
                     call_budget=external_call_budget,
                     rag_retriever=rag_retriever,
+                    price_engine=price_engine,
                 )
             elif settings.tavily_configured:
                 assert provider_http_client is not None
@@ -211,12 +244,14 @@ def _lifespan(settings: Settings) -> Callable[[FastAPI], AbstractAsyncContextMan
                     provider_factory=tavily_provider_factory,
                     call_budget=external_call_budget,
                     rag_retriever=rag_retriever,
+                    price_engine=price_engine,
                 )
             else:
                 app.state.trip_planner = LangGraphTripPlanner(
                     settings,
                     call_budget=external_call_budget,
                     rag_retriever=rag_retriever,
+                    price_engine=price_engine,
                 )
         cleanup_task: asyncio.Task[None] | None = None
         if settings.cleanup_enabled:
@@ -258,6 +293,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         logger.warning(smtp_warning)
     for tavily_warning in app_settings.tavily_configuration_warnings():
         logger.warning(tavily_warning)
+    for serpapi_warning in app_settings.serpapi_configuration_warnings():
+        logger.warning(serpapi_warning)
     for rag_warning in app_settings.rag_configuration_warnings():
         logger.warning(rag_warning)
 
